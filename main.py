@@ -145,7 +145,12 @@ def jira_create_issue(summary: str, description: str) -> str:
                 "content": [
                     {
                         "type": "paragraph",
-                        "content": [{"type": "text", "text": description}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": description,
+                            }
+                        ],
                     }
                 ],
             },
@@ -159,15 +164,19 @@ def jira_create_issue(summary: str, description: str) -> str:
         headers={"Accept": "application/json"},
         timeout=30,
     )
-   if r.status_code >= 400:
-    print("JIRA CREATE ISSUE ERROR:", r.status_code)
-    try:
-        print(r.json())
-    except Exception:
-        print(r.text)
-    r.raise_for_status()
 
-return r.json()["key"]
+    # DEBUG výpis při chybě
+    if r.status_code >= 400:
+        print("JIRA CREATE ISSUE ERROR")
+        print("Status code:", r.status_code)
+        try:
+            print("Response JSON:", r.json())
+        except Exception:
+            print("Response text:", r.text)
+
+    r.raise_for_status()
+    return r.json()["key"]
+
 
 
 
