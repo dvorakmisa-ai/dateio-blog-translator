@@ -1,8 +1,8 @@
-name: Daily blog translate to HU and create Jira task
+name: Daily blog translate to HU and post to Teams
 
 on:
   schedule:
-    - cron: "15 6 * * *"  # každý den 06:15 UTC (v Praze typicky 07:15/08:15 dle DST)
+    - cron: "15 6 * * *"   # každý den 06:15 UTC
   workflow_dispatch:
 
 jobs:
@@ -22,16 +22,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-    - name: Run translator
-  env:
-    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-    OPENAI_MODEL: gpt-4.1-mini
-  run: |
-    python main.py
+      - name: Run translator
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          OPENAI_MODEL: gpt-4.1-mini
+        run: |
+          python main.py
 
       - name: Upload state.json as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state
           path: state.json
+          if-no-files-found: ignore
