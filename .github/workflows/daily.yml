@@ -22,16 +22,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run translator
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
-          OPENAI_MODEL: gpt-4.1-mini
-        run: |
-          python main.py
+    - name: Run translator
+  env:
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+    OPENAI_MODEL: gpt-4.1-mini
+  run: |
+    python main.py
 
       - name: Upload state.json as artifact
         uses: actions/upload-artifact@v4
