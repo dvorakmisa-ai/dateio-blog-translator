@@ -1,12 +1,9 @@
-name: Daily blog translate to HU, save DOCX to repo, post link to Teams
+name: Daily blog translate to HU and create Jira task
 
 on:
   schedule:
     - cron: "15 6 * * *"
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   run:
@@ -14,8 +11,6 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,7 +25,19 @@ jobs:
       - name: Run translator
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+          JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }} # volitelné; když není, použije se "Task"
           OPENAI_MODEL: gpt-4.1-mini
         run: |
           python main.py
+
+      - name: Upload state.json as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state
+          path: state.json
+          if-no-files-found: ignore
