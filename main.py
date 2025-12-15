@@ -262,16 +262,50 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
 def jira_get_issue_type_name(project_key: str) -> str:
     """
-    Zjistí validní issue type pro projekt (podle /project/{key}?expand=issueTypes).
-    Pokud je nastaven JIRA_ISSUE_TYPE a existuje, použije ho. Jinak vybere rozumný fallback.
+    Zjistí validní issue type pro projekt.
+    Pokud projekt neexistuje / není viditelný (404), vypíše projekty dostupné pro účet
+    a hodí srozumitelnou chybu.
     """
     desired = (os.getenv("JIRA_ISSUE_TYPE") or "").strip()
+    project_key = (project_key or "").strip().strip('"').strip("'")
 
+    # 1) Zkusíme načíst projekt + issueTypes
     r = jira_request(
         "GET",
         f"/rest/api/3/project/{project_key}",
         params={"expand": "issueTypes"},
     )
+
+    if r.status_code == 404:
+        print("\nJIRA PROJECT LOOKUP: 404 Not Found")
+        try:
+            print("Response JSON:", r.json())
+        except Exception:
+            print("Response text:", r.text)
+
+        # 2) Vypíšeme projekty, které účet vidí (pomůže najít správný JIRA_PROJECT_KEY)
+        print("\nViditelné projekty pro tento účet (keys):")
+        s = jira_request(
+            "GET",
+            "/rest/api/3/project/search",
+            params={"maxResults": 50},
+        )
+
+        if s.status_code < 400:
+            data = s.json()
+            values = data.get("values", [])
+            if not values:
+                print("(0 projektů – účet nejspíš nemá přístup k žádným projektům.)")
+            for p in values:
+                print("-", p.get("key"), ":", p.get("name"))
+        else:
+            print("(Nepodařilo se vypsat projekty přes /project/search.)")
+
+        raise RuntimeError(
+            f"Projekt s key '{project_key}' nebyl nalezen nebo není viditelný. "
+            f"Zkontroluj GitHub Secret JIRA_PROJECT_KEY a práva účtu."
+        )
+
     r.raise_for_status()
     data = r.json()
 
@@ -279,7 +313,7 @@ def jira_get_issue_type_name(project_key: str) -> str:
     names = [it.get("name") for it in issue_types if it.get("name")]
 
     if not names:
-        raise RuntimeError("Projekt nevrátil žádné issueTypes. Zkontroluj oprávnění nebo typ projektu.")
+        raise RuntimeError("Projekt je dostupný, ale nevrátil žádné issueTypes.")
 
     print("Dostupné issue types v projektu:", ", ".join(names))
 
