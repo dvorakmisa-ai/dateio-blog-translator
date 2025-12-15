@@ -84,6 +84,7 @@ def extract_post_urls_from_index(index_html: str) -> list[str]:
 def extract_article_text(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "html.parser")
 
+    # ---- TITLE ----
     title = "Untitled"
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
@@ -91,6 +92,25 @@ def extract_article_text(article_html: str, article_url: str) -> dict:
     elif soup.title and soup.title.get_text(strip=True):
         title = soup.title.get_text(strip=True)
 
+    # ---- META TITLE ----
+    meta_title = None
+    og_title = soup.find("meta", property="og:title")
+    if og_title and og_title.get("content"):
+        meta_title = og_title["content"]
+    elif soup.title:
+        meta_title = soup.title.get_text(strip=True)
+
+    # ---- META DESCRIPTION ----
+    meta_description = None
+    meta_desc_tag = soup.find("meta", attrs={"name": "description"})
+    if meta_desc_tag and meta_desc_tag.get("content"):
+        meta_description = meta_desc_tag["content"]
+    else:
+        og_desc = soup.find("meta", property="og:description")
+        if og_desc and og_desc.get("content"):
+            meta_description = og_desc["content"]
+
+    # ---- BODY ----
     paragraphs = [
         p.get_text(" ", strip=True)
         for p in soup.find_all("p")
@@ -101,6 +121,8 @@ def extract_article_text(article_html: str, article_url: str) -> dict:
     return {
         "url": article_url,
         "title": title,
+        "meta_title": meta_title,
+        "meta_description": meta_description,
         "body": body,
     }
 
