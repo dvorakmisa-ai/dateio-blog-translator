@@ -125,6 +125,48 @@ Pravidla:
 # ======================
 # JIRA
 # ======================
+def jira_get_valid_issue_type_name() -> str:
+    """
+    Vrátí název issue typu, který je validní pro daný projekt.
+    Používá endpoint createmeta (v3). Když preferované typy nejsou, vezme první dostupný.
+    """
+    base = os.environ["JIRA_BASE_URL"].rstrip("/")
+    email = os.environ["JIRA_EMAIL"]
+    token = os.environ["JIRA_API_TOKEN"]
+    project = os.environ["JIRA_PROJECT_KEY"]
+
+    url = f"{base}/rest/api/3/issue/createmeta"
+
+    r = requests.get(
+        url,
+        auth=(email, token),
+        headers={"Accept": "application/json"},
+        params={"projectKeys": project, "expand": "projects.issuetypes"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    projects = data.get("projects", [])
+    if not projects:
+        raise RuntimeError("Jira createmeta nevrátil žádný projekt – zkontroluj JIRA_PROJECT_KEY.")
+
+    issuetypes = projects[0].get("issuetypes", [])
+    if not issuetypes:
+        raise RuntimeError("Jira createmeta nevrátil žádné issue typy pro projekt.")
+
+    # Preferované typy (zkusíme v tomto pořadí)
+    preferred = ["Task", "Úkol", "Story", "Bug"]
+
+    available_names = [it.get("name") for it in issuetypes if it.get("name")]
+    for name in preferred:
+        if name in available_names:
+            return name
+
+    # fallback: první dostupný typ
+    return available_names[0]
+
+
 def jira_create_issue(summary: str, description: str) -> str:
     base = os.environ["JIRA_BASE_URL"].rstrip("/")
     email = os.environ["JIRA_EMAIL"]
