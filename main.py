@@ -1,77 +1,212 @@
 import os
+import re
+import json
+from urllib.parse import urljoin
+
 import requests
+from bs4 import BeautifulSoup
+from openai import OpenAI
 
-def jira_whoami() -> None:
-    base = os.environ["JIRA_BASE_URL"].rstrip("/")
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
 
-    url = f"{base}/rest/api/3/myself"
-    r = requests.get(url, auth=(email, token), headers={"Accept": "application/json"}, timeout=30)
+# ======================
+# KONFIGURACE
+# ======================
+BLOG_INDEX = "https://www.dateioplatform.com/resources/blog"
+STATE_FILE = "state.json"
 
-    print("\n=== JIRA WHOAMI (/myself) ===")
-    print("HTTP:", r.status_code)
-    try:
-        print(r.json())
-    except Exception:
-        print(r.text)
+
+# ======================
+# STATE (už zpracované URL)
+# ======================
+def load_state() -> set[str]:
+    if not os.path.exists(STATE_FILE):
+        return set()
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return set(data.get("processed_urls", []))
+
+
+def save_state(processed_urls: set[str]) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"processed_urls": sorted(processed_urls)},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+# ======================
+# HTTP HELPERS
+# ======================
+def fetch_html(url: str) -> str:
+    r = requests.get(
+        url,
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    r.raise_for_status()
+    return r.text
+
+
+# ======================
+# BLOG INDEX → URL článků
+# ======================
+def extract_post_urls_from_index(index_html: str) -> list[str]:
+    soup = BeautifulSoup(index_html, "html.parser")
+    urls = set()
+
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if "/resources/post/" in href:
+            urls.add(urljoin(BLOG_INDEX, href))
+
+    return sorted(urls)
+
+
+# ======================
+# DETAIL ČLÁNKU → TEXT
+# ======================
+def extract_article_text(article_html: str, article_url: str) -> dict:
+    """
+    Jednoduchá extrakce:
+    - title: první <h1> nebo <title>
+    - body: text z <p>
+    """
+    soup = BeautifulSoup(article_html, "html.parser")
+
+    title = "Untitled"
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        title = h1.get_text(strip=True)
+    elif soup.title and soup.title.get_text(strip=True):
+        title = soup.title.get_text(strip=True)
+
+    paragraphs = [
+        p.get_text(" ", strip=True)
+        for p in soup.find_all("p")
+        if p.get_text(strip=True)
+    ]
+    body = "\n\n".join(paragraphs).strip()
+
+    return {
+        "url": article_url,
+        "title": title,
+        "body": body,
+    }
+
+
+# ======================
+# OPENAI – PŘEKLAD
+# ======================
+def translate_to_hungarian(client: OpenAI, title: str, body: str) -> str:
+    prompt = f"""
+Přelož následující článek do maďarštiny.
+
+Pravidla:
+- zachovej význam i marketingový tón
+- nezkracuj
+- zachovej odstavce
+- vrať výstup v Markdownu
+
+# Název
+{title}
+
+# Text
+{body}
+""".strip()
+
+    response = client.responses.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        input=prompt,
+    )
+
+    return response.output_text.strip()
+
+
+# ======================
+# MS TEAMS – Webhook zpráva
+# ======================
+def send_message_to_teams(title: str, article_url: str, translation_md: str) -> None:
+    """
+    Pošle zprávu do Teams přes Incoming Webhook.
+    Pozn.: Teams má limit délky zprávy, proto posíláme zkrácený výřez + odkaz.
+    """
+    webhook_url = os.environ["TEAMS_WEBHOOK_URL"].strip()
+
+    # Zabráníme příliš dlouhé zprávě (Teams limit se může lišit)
+    max_chars = 3500
+    snippet = translation_md
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars] + "\n\n…(zkráceno)"
+
+    payload = {
+        "text": (
+            "📄 **Nový blog přeložen do maďarštiny**\n\n"
+            f"**Název:** {title}\n\n"
+            f"🔗 **Originál:** {article_url}\n\n"
+            "---\n\n"
+            f"{snippet}"
+        )
+    }
+
+    r = requests.post(
+        webhook_url,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+
+    if r.status_code >= 400:
+        print("TEAMS WEBHOOK ERROR")
+        print("Status code:", r.status_code)
+        print("Response text:", r.text)
 
     r.raise_for_status()
 
 
-def jira_print_visible_projects() -> None:
-    base = os.environ["JIRA_BASE_URL"].rstrip("/")
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
+# ======================
+# MAIN
+# ======================
+def main():
+    processed = load_state()
 
-    url = f"{base}/rest/api/3/project/search"
+    index_html = fetch_html(BLOG_INDEX)
+    post_urls = extract_post_urls_from_index(index_html)
 
-    print("\n=== JIRA PROJECTS (/project/search) ===")
+    new_urls = [u for u in post_urls if u not in processed]
 
-    start_at = 0
-    total_printed = 0
+    if not new_urls:
+        print("Žádné nové články.")
+        save_state(processed)  # vždy vytvoří state.json
+        return
 
-    while True:
-        r = requests.get(
-            url,
-            auth=(email, token),
-            headers={"Accept": "application/json"},
-            params={"maxResults": 50, "startAt": start_at},
-            timeout=30,
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+    for url in new_urls:
+        article_html = fetch_html(url)
+        article = extract_article_text(article_html, url)
+
+        if not article["body"]:
+            print(f"Nelze extrahovat text: {url}")
+            processed.add(url)
+            continue
+
+        translation = translate_to_hungarian(client, article["title"], article["body"])
+
+        # (volitelné) slug jen pro hezké logy / budoucí ukládání souborů
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", url.split("/")[-1]).strip("-")
+
+        send_message_to_teams(
+            title=article["title"],
+            article_url=url,
+            translation_md=translation,
         )
 
-        print("Page startAt:", start_at, "HTTP:", r.status_code)
+        print(f"Odesláno do Teams: {slug}")
+        processed.add(url)
 
-        if r.status_code >= 400:
-            try:
-                print(r.json())
-            except Exception:
-                print(r.text)
-            r.raise_for_status()
-
-        data = r.json()
-        values = data.get("values", [])
-        total = data.get("total", 0)
-
-        if not values:
-            break
-
-        for p in values:
-            print("-", p.get("key"), ":", p.get("name"))
-            total_printed += 1
-
-        start_at += len(values)
-        if start_at >= total:
-            break
-
-    print("=== Printed:", total_printed, "projects ===\n")
-
-
-def main():
-    jira_whoami()
-    jira_print_visible_projects()
-    print("DIAGNOSTIKA HOTOVÁ – tady program končí schválně.")
-    return
+    save_state(processed)
 
 
 if __name__ == "__main__":
