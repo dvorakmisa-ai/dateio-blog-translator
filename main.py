@@ -164,7 +164,6 @@ def adf_text(text: str) -> dict:
 
 
 def adf_paragraph(text: str) -> dict:
-    # Jira ADF text node max length isn’t strict documented here; we keep paragraphs reasonable.
     return {"type": "paragraph", "content": [adf_text(text)]}
 
 
@@ -173,12 +172,6 @@ def adf_heading(text: str, level: int = 2) -> dict:
 
 
 def mdish_to_adf_blocks(text: str) -> list[dict]:
-    """
-    Very simple conversion:
-    - split into blocks by blank lines
-    - treat lines starting with # as headings
-    - everything else as paragraphs
-    """
     blocks: list[dict] = []
     text = (text or "").strip()
     if not text:
@@ -189,14 +182,12 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
         if not b:
             continue
 
-        # Heading like "# Title" or "## Title"
         m = re.match(r"^(#{1,6})\s+(.*)$", b)
         if m:
             level = min(6, max(1, len(m.group(1))))
             blocks.append(adf_heading(m.group(2).strip(), level=level))
             continue
 
-        # Otherwise paragraph (collapse newlines inside)
         b = re.sub(r"\n+", "\n", b)
         blocks.append(adf_paragraph(b))
 
@@ -204,10 +195,6 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
 
 
 def build_description_adf(article: dict, hu: dict) -> dict:
-    """
-    Builds a Jira Cloud description in Atlassian Document Format (ADF).
-    Includes original + translated metadata + full translated body.
-    """
     content: list[dict] = []
 
     content.append(adf_heading("HU překlad blogu", level=2))
@@ -250,20 +237,19 @@ def jira_request(method: str, path: str, **kwargs) -> requests.Response:
         **kwargs,
     )
 
-    # Helpful auth/debug hints
     if r.status_code == 401:
         raise RuntimeError(
-            "Jira vrátila 401 Unauthorized. Zkontroluj:\n"
+            "Jira vrátila 401 Unauthorized.\n"
+            "Zkontroluj:\n"
             "- JIRA_BASE_URL (např. https://firma.atlassian.net)\n"
             "- JIRA_EMAIL (stejný účet, který token vytvořil)\n"
-            "- JIRA_API_TOKEN (zkus vygenerovat nový a vložit do Secrets)\n"
+            "- JIRA_API_TOKEN (zkus vygenerovat nový)\n"
         )
 
     return r
 
 
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
-    # Uses the newer endpoint /rest/api/3/search/jql
     jql = f'project = {project_key} AND labels = "dateio-auto-translate" AND text ~ "{article_url}"'
     r = jira_request(
         "GET",
@@ -274,9 +260,48 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     return r.json().get("total", 0) > 0
 
 
+def jira_get_issue_type_name(project_key: str) -> str:
+    """
+    Zjistí validní issue type pro projekt (podle /project/{key}?expand=issueTypes).
+    Pokud je nastaven JIRA_ISSUE_TYPE a existuje, použije ho. Jinak vybere rozumný fallback.
+    """
+    desired = (os.getenv("JIRA_ISSUE_TYPE") or "").strip()
+
+    r = jira_request(
+        "GET",
+        f"/rest/api/3/project/{project_key}",
+        params={"expand": "issueTypes"},
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    issue_types = data.get("issueTypes", [])
+    names = [it.get("name") for it in issue_types if it.get("name")]
+
+    if not names:
+        raise RuntimeError("Projekt nevrátil žádné issueTypes. Zkontroluj oprávnění nebo typ projektu.")
+
+    print("Dostupné issue types v projektu:", ", ".join(names))
+
+    if desired:
+        if desired in names:
+            print("Používám issue type z JIRA_ISSUE_TYPE:", desired)
+            return desired
+        print(f"Pozor: JIRA_ISSUE_TYPE='{desired}' není validní pro projekt. Použiju fallback.")
+
+    preferred = ["Úkol", "Task", "Story", "Bug", "Request", "Service Request"]
+    for p in preferred:
+        if p in names:
+            print("Vybraný issue type (fallback):", p)
+            return p
+
+    print("Vybraný issue type (first):", names[0])
+    return names[0]
+
+
 def jira_create_issue(summary: str, description_adf: dict) -> str:
     project_key = require_env("JIRA_PROJECT_KEY").strip().strip('"').strip("'")
-    issue_type = os.getenv("JIRA_ISSUE_TYPE", "Task")  # override in Secrets/env if needed
+    issue_type = jira_get_issue_type_name(project_key)
 
     payload = {
         "fields": {
@@ -296,7 +321,6 @@ def jira_create_issue(summary: str, description_adf: dict) -> str:
     )
 
     if r.status_code >= 400:
-        # Print Jira's exact message to logs
         print("JIRA CREATE ISSUE ERROR", r.status_code)
         try:
             print(r.json())
@@ -332,7 +356,6 @@ def main():
     project_key = require_env("JIRA_PROJECT_KEY").strip().strip('"').strip("'")
 
     for url in new_urls:
-        # extra guard against duplicates (if state got lost)
         if jira_issue_exists_for_url(project_key, url):
             print(f"V Jira už existuje issue pro: {url}")
             processed.add(url)
