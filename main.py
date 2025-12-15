@@ -11,6 +11,49 @@ from openai import OpenAI
 BLOG_INDEX = "https://www.dateioplatform.com/resources/blog"
 STATE_FILE = "state.json"
 
+def jira_print_visible_projects() -> None:
+    base = os.environ["JIRA_BASE_URL"].rstrip("/")
+    email = os.environ["JIRA_EMAIL"]
+    token = os.environ["JIRA_API_TOKEN"]
+
+    url = f"{base}/rest/api/3/project/search"
+
+    start_at = 0
+    total_printed = 0
+
+    print("\n=== JIRA: viditelné projekty pro tento účet ===")
+
+    while True:
+        r = requests.get(
+            url,
+            auth=(email, token),
+            headers={"Accept": "application/json"},
+            params={"maxResults": 50, "startAt": start_at},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            print("PROJECT SEARCH ERROR:", r.status_code)
+            try:
+                print(r.json())
+            except Exception:
+                print(r.text)
+            return
+
+        data = r.json()
+        values = data.get("values", [])
+        if not values:
+            break
+
+        for p in values:
+            print("-", p.get("key"), ":", p.get("name"))
+            total_printed += 1
+
+        start_at += len(values)
+        if start_at >= data.get("total", start_at):
+            break
+
+    print("=== Celkem projektů:", total_printed, "===\n")
+
 
 # ----------------------
 # STATE (processed URLs)
