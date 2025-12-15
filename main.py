@@ -8,16 +8,13 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 
 
-# ======================
-# KONFIGURACE
-# ======================
 BLOG_INDEX = "https://www.dateioplatform.com/resources/blog"
 STATE_FILE = "state.json"
 
 
-# ======================
-# STATE (už zpracované URL)
-# ======================
+# ----------------------
+# STATE (processed URLs)
+# ----------------------
 def load_state() -> set[str]:
     if not os.path.exists(STATE_FILE):
         return set()
@@ -36,9 +33,9 @@ def save_state(processed_urls: set[str]) -> None:
         )
 
 
-# ======================
-# HTTP HELPERS
-# ======================
+# ----------------------
+# HTTP helper
+# ----------------------
 def fetch_html(url: str) -> str:
     r = requests.get(
         url,
@@ -49,9 +46,9 @@ def fetch_html(url: str) -> str:
     return r.text
 
 
-# ======================
-# BLOG INDEX → URL článků
-# ======================
+# ----------------------
+# Blog index -> post URLs
+# ----------------------
 def extract_post_urls_from_index(index_html: str) -> list[str]:
     soup = BeautifulSoup(index_html, "html.parser")
     urls = set()
@@ -64,27 +61,24 @@ def extract_post_urls_from_index(index_html: str) -> list[str]:
     return sorted(urls)
 
 
-# ======================
-# DETAIL ČLÁNKU → TEXT
-# ======================
+# ----------------------
+# Article page -> text
+# ----------------------
 def extract_article_text(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "html.parser")
 
-    # Title
     title = "Untitled"
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
         title = h1.get_text(strip=True)
-    elif soup.title:
+    elif soup.title and soup.title.get_text(strip=True):
         title = soup.title.get_text(strip=True)
 
-    # Body – vezmeme hlavně <p>
     paragraphs = [
         p.get_text(" ", strip=True)
         for p in soup.find_all("p")
         if p.get_text(strip=True)
     ]
-
     body = "\n\n".join(paragraphs).strip()
 
     return {
@@ -94,9 +88,9 @@ def extract_article_text(article_html: str, article_url: str) -> dict:
     }
 
 
-# ======================
-# OPENAI – PŘEKLAD
-# ======================
+# ----------------------
+# OpenAI translation
+# ----------------------
 def translate_to_hungarian(client: OpenAI, title: str, body: str) -> str:
     prompt = f"""
 Přelož následující článek do maďarštiny.
@@ -122,13 +116,13 @@ Pravidla:
     return response.output_text.strip()
 
 
-# ======================
-# JIRA
-# ======================
+# ----------------------
+# Jira helpers
+# ----------------------
 def jira_get_valid_issue_type_name() -> str:
     """
-    Vrátí název issue typu, který je validní pro daný projekt.
-    Používá endpoint createmeta (v3). Když preferované typy nejsou, vezme první dostupný.
+    Zjistí, jaké issue typy jsou povolené pro daný projekt,
+    a vrátí jeden validní název (preferuje Task/Úkol/Story/Bug).
     """
     base = os.environ["JIRA_BASE_URL"].rstrip("/")
     email = os.environ["JIRA_EMAIL"]
@@ -149,22 +143,53 @@ def jira_get_valid_issue_type_name() -> str:
 
     projects = data.get("projects", [])
     if not projects:
-        raise RuntimeError("Jira createmeta nevrátil žádný projekt – zkontroluj JIRA_PROJECT_KEY.")
+        raise RuntimeError(
+            "Jira createmeta nevrátil žádný projekt. Zkontroluj JIRA_PROJECT_KEY."
+        )
 
     issuetypes = projects[0].get("issuetypes", [])
     if not issuetypes:
-        raise RuntimeError("Jira createmeta nevrátil žádné issue typy pro projekt.")
+        raise RuntimeError(
+            "Jira createmeta nevrátil žádné issue typy pro tento projekt."
+        )
 
-    # Preferované typy (zkusíme v tomto pořadí)
+    available = [it.get("name") for it in issuetypes if it.get("name")]
+
     preferred = ["Task", "Úkol", "Story", "Bug"]
-
-    available_names = [it.get("name") for it in issuetypes if it.get("name")]
     for name in preferred:
-        if name in available_names:
+        if name in available:
             return name
 
-    # fallback: první dostupný typ
-    return available_names[0]
+    return available[0]
+
+
+def jira_already_has_issue_for_url(article_url: str) -> bool:
+    """
+    Kontrola duplicit přes JQL.
+    Používá nový endpoint: /rest/api/3/search/jql
+    """
+    base = os.environ["JIRA_BASE_URL"].rstrip("/")
+    email = os.environ["JIRA_EMAIL"]
+    token = os.environ["JIRA_API_TOKEN"]
+    project = os.environ["JIRA_PROJECT_KEY"]
+
+    jql = (
+        f'project = {project} '
+        f'AND labels = "dateio-auto-translate" '
+        f'AND text ~ "{article_url}"'
+    )
+
+    url = f"{base}/rest/api/3/search/jql"
+
+    r = requests.get(
+        url,
+        auth=(email, token),
+        headers={"Accept": "application/json"},
+        params={"jql": jql, "maxResults": 1, "fields": "key"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("total", 0) > 0
 
 
 def jira_create_issue(summary: str, description: str) -> str:
@@ -173,8 +198,8 @@ def jira_create_issue(summary: str, description: str) -> str:
     token = os.environ["JIRA_API_TOKEN"]
     project = os.environ["JIRA_PROJECT_KEY"]
 
+    # IMPORTANT: musí být mimo payload dict!
     issue_type_name = jira_get_valid_issue_type_name()
-
 
     url = f"{base}/rest/api/3/issue"
 
@@ -182,10 +207,7 @@ def jira_create_issue(summary: str, description: str) -> str:
         "fields": {
             "project": {"key": project},
             "summary": summary,
-            issue_type_name = jira_get_valid_issue_type_name()
-            ...
             "issuetype": {"name": issue_type_name},
-
             "labels": ["dateio-auto-translate"],
             "description": {
                 "type": "doc",
@@ -193,12 +215,7 @@ def jira_create_issue(summary: str, description: str) -> str:
                 "content": [
                     {
                         "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": description,
-                            }
-                        ],
+                        "content": [{"type": "text", "text": description}],
                     }
                 ],
             },
@@ -213,7 +230,6 @@ def jira_create_issue(summary: str, description: str) -> str:
         timeout=30,
     )
 
-    # DEBUG výpis při chybě
     if r.status_code >= 400:
         print("JIRA CREATE ISSUE ERROR")
         print("Status code:", r.status_code)
@@ -224,8 +240,6 @@ def jira_create_issue(summary: str, description: str) -> str:
 
     r.raise_for_status()
     return r.json()["key"]
-
-
 
 
 def jira_attach_file(issue_key: str, filename: str, content: bytes) -> None:
@@ -245,34 +259,9 @@ def jira_attach_file(issue_key: str, filename: str, content: bytes) -> None:
     r.raise_for_status()
 
 
-def jira_already_has_issue_for_url(article_url: str) -> bool:
-    base = os.environ["JIRA_BASE_URL"].rstrip("/")
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
-    project = os.environ["JIRA_PROJECT_KEY"]
-
-    jql = (
-        f'project = {project} '
-        f'AND labels = "dateio-auto-translate" '
-        f'AND text ~ "{article_url}"'
-    )
-
-    url = f"{base}/rest/api/3/search/jql"
-
-    r = requests.get(
-        url,
-        auth=(email, token),
-        headers={"Accept": "application/json"},
-        params={"jql": jql, "maxResults": 1},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json().get("total", 0) > 0
-
-
-# ======================
-# MAIN
-# ======================
+# ----------------------
+# Main
+# ----------------------
 def main():
     processed = load_state()
 
@@ -283,7 +272,7 @@ def main():
 
     if not new_urls:
         print("Žádné nové články.")
-        save_state(processed)
+        save_state(processed)  # vždy vytvoří state.json
         return
 
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -302,14 +291,12 @@ def main():
             processed.add(url)
             continue
 
-        translation = translate_to_hungarian(
-            client, article["title"], article["body"]
-        )
+        translation = translate_to_hungarian(client, article["title"], article["body"])
 
-        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", url.split("/")[-1])
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", url.split("/")[-1]).strip("-")
         filename = f"{slug}-hu.md"
 
-        content = (
+        md_content = (
             f"# {article['title']}\n\n"
             f"Originál: {url}\n\n"
             f"---\n\n"
@@ -318,10 +305,10 @@ def main():
 
         issue_key = jira_create_issue(
             summary=f"[HU] Překlad: {article['title']}",
-            description=f"Překlad do maďarštiny.\n\nOriginál: {url}",
+            description=f"Překlad do maďarštiny.\n\nOriginál: {url}\n\nPřeklad je v příloze (Markdown).",
         )
 
-        jira_attach_file(issue_key, filename, content)
+        jira_attach_file(issue_key, filename, md_content)
 
         print(f"Hotovo → {issue_key}")
         processed.add(url)
