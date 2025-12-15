@@ -136,38 +136,79 @@ Pravidla:
 # ======================
 # MS TEAMS – Webhook
 # ======================
+def split_into_chunks(text: str, max_chars: int) -> list[str]:
+    """
+    Rozdělí text na části tak, aby se ideálně lámalo na konci odstavce.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    start = 0
+    n = len(text)
+
+    while start < n:
+        end = min(start + max_chars, n)
+
+        # zkus najít nejbližší "dobré" místo k zalomení (dvojitý newline) směrem dozadu
+        cut = text.rfind("\n\n", start, end)
+        if cut == -1 or cut <= start + int(max_chars * 0.6):
+            # fallback: zkus aspoň jeden newline
+            cut = text.rfind("\n", start, end)
+        if cut == -1 or cut <= start + int(max_chars * 0.6):
+            # poslední fallback: tvrdý řez
+            cut = end
+
+        chunk = text[start:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        start = cut
+
+    return chunks
+
+
 def send_message_to_teams(title: str, article_url: str, translation_md: str) -> None:
     webhook_url = require_env("TEAMS_WEBHOOK_URL").strip()
 
-    # Teams má limit délky zprávy – zkrátíme
+    # bezpečný limit pro Teams webhook
     max_chars = 3500
-    snippet = translation_md
-    if len(snippet) > max_chars:
-        snippet = snippet[:max_chars] + "\n\n…(zkráceno)"
+    parts = split_into_chunks(translation_md, max_chars=max_chars)
 
-    payload = {
-        "text": (
-            "📄 **Nový blog přeložen do maďarštiny**\n\n"
-            f"**Název:** {title}\n\n"
-            f"🔗 **Originál:** {article_url}\n\n"
-            "---\n\n"
-            f"{snippet}"
+    total = len(parts)
+    for i, part in enumerate(parts, start=1):
+        if i == 1:
+            header = (
+                "📄 **Nový blog přeložen do maďarštiny**\n\n"
+                f"**Název:** {title}\n\n"
+                f"🔗 **Originál:** {article_url}\n\n"
+                f"**Část:** {i}/{total}\n\n"
+                "---\n\n"
+            )
+        else:
+            header = (
+                f"📄 **Pokračování překladu**\n\n"
+                f"**Název:** {title}\n\n"
+                f"**Část:** {i}/{total}\n\n"
+                "---\n\n"
+            )
+
+        payload = {"text": header + part}
+
+        r = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
         )
-    }
 
-    r = requests.post(
-        webhook_url,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
+        if r.status_code >= 400:
+            print("TEAMS WEBHOOK ERROR")
+            print("Status code:", r.status_code)
+            print("Response text:", r.text)
 
-    if r.status_code >= 400:
-        print("TEAMS WEBHOOK ERROR")
-        print("Status code:", r.status_code)
-        print("Response text:", r.text)
-
-    r.raise_for_status()
+        r.raise_for_status()
 
 
 # ======================
