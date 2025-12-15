@@ -22,6 +22,21 @@ def require_env(name: str) -> str:
             f"Chybí proměnná {name}. Přidej ji do GitHub Secrets a předej ve workflow env."
         )
     return v
+    
+me = jira_request("GET", "/rest/api/3/myself")
+print("JIRA /myself:", me.status_code)
+if me.status_code < 400:
+    j = me.json()
+    print("Account displayName:", j.get("displayName"))
+    print("Account emailAddress:", j.get("emailAddress"))
+
+proj = jira_request("GET", "/rest/api/3/project/search", params={"maxResults": 50})
+print("JIRA /project/search:", proj.status_code)
+if proj.status_code < 400:
+    values = proj.json().get("values", [])
+    print("Visible projects count:", len(values))
+    for p in values[:50]:
+        print("-", p.get("key"), ":", p.get("name"))
 
 
 def load_state() -> set[str]:
