@@ -22,21 +22,6 @@ def require_env(name: str) -> str:
             f"Chybí proměnná {name}. Přidej ji do GitHub Secrets a předej ve workflow env."
         )
     return v
-    
-me = jira_request("GET", "/rest/api/3/myself")
-print("JIRA /myself:", me.status_code)
-if me.status_code < 400:
-    j = me.json()
-    print("Account displayName:", j.get("displayName"))
-    print("Account emailAddress:", j.get("emailAddress"))
-
-proj = jira_request("GET", "/rest/api/3/project/search", params={"maxResults": 50})
-print("JIRA /project/search:", proj.status_code)
-if proj.status_code < 400:
-    values = proj.json().get("values", [])
-    print("Visible projects count:", len(values))
-    for p in values[:50]:
-        print("-", p.get("key"), ":", p.get("name"))
 
 
 def load_state() -> set[str]:
@@ -187,6 +172,12 @@ def adf_heading(text: str, level: int = 2) -> dict:
 
 
 def mdish_to_adf_blocks(text: str) -> list[dict]:
+    """
+    Very simple conversion:
+    - split into blocks by blank lines
+    - treat blocks starting with # as headings
+    - everything else as paragraphs
+    """
     blocks: list[dict] = []
     text = (text or "").strip()
     if not text:
@@ -264,6 +255,32 @@ def jira_request(method: str, path: str, **kwargs) -> requests.Response:
     return r
 
 
+def jira_diagnostic() -> None:
+    """
+    Optional debug: prints whoami + visible projects.
+    Enable with env JIRA_DIAGNOSTIC=1
+    """
+    if os.getenv("JIRA_DIAGNOSTIC", "").strip() != "1":
+        return
+
+    print("\n=== JIRA DIAGNOSTIC ===")
+    me = jira_request("GET", "/rest/api/3/myself")
+    print("JIRA /myself:", me.status_code)
+    if me.status_code < 400:
+        j = me.json()
+        print("displayName:", j.get("displayName"))
+        print("emailAddress:", j.get("emailAddress"))
+
+    proj = jira_request("GET", "/rest/api/3/project/search", params={"maxResults": 50})
+    print("JIRA /project/search:", proj.status_code)
+    if proj.status_code < 400:
+        values = proj.json().get("values", [])
+        print("Visible projects count:", len(values))
+        for p in values:
+            print("-", p.get("key"), ":", p.get("name"))
+    print("=== END DIAGNOSTIC ===\n")
+
+
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     jql = f'project = {project_key} AND labels = "dateio-auto-translate" AND text ~ "{article_url}"'
     r = jira_request(
@@ -277,14 +294,13 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
 def jira_get_issue_type_name(project_key: str) -> str:
     """
-    Zjistí validní issue type pro projekt.
-    Pokud projekt neexistuje / není viditelný (404), vypíše projekty dostupné pro účet
-    a hodí srozumitelnou chybu.
+    Gets valid issue type for the project via:
+      GET /rest/api/3/project/{key}?expand=issueTypes
+    If the project isn't visible (404), we raise a clear error.
     """
     desired = (os.getenv("JIRA_ISSUE_TYPE") or "").strip()
     project_key = (project_key or "").strip().strip('"').strip("'")
 
-    # 1) Zkusíme načíst projekt + issueTypes
     r = jira_request(
         "GET",
         f"/rest/api/3/project/{project_key}",
@@ -292,33 +308,12 @@ def jira_get_issue_type_name(project_key: str) -> str:
     )
 
     if r.status_code == 404:
-        print("\nJIRA PROJECT LOOKUP: 404 Not Found")
         try:
-            print("Response JSON:", r.json())
+            print("JIRA PROJECT LOOKUP 404 JSON:", r.json())
         except Exception:
-            print("Response text:", r.text)
-
-        # 2) Vypíšeme projekty, které účet vidí (pomůže najít správný JIRA_PROJECT_KEY)
-        print("\nViditelné projekty pro tento účet (keys):")
-        s = jira_request(
-            "GET",
-            "/rest/api/3/project/search",
-            params={"maxResults": 50},
-        )
-
-        if s.status_code < 400:
-            data = s.json()
-            values = data.get("values", [])
-            if not values:
-                print("(0 projektů – účet nejspíš nemá přístup k žádným projektům.)")
-            for p in values:
-                print("-", p.get("key"), ":", p.get("name"))
-        else:
-            print("(Nepodařilo se vypsat projekty přes /project/search.)")
-
+            print("JIRA PROJECT LOOKUP 404 TEXT:", r.text)
         raise RuntimeError(
-            f"Projekt s key '{project_key}' nebyl nalezen nebo není viditelný. "
-            f"Zkontroluj GitHub Secret JIRA_PROJECT_KEY a práva účtu."
+            f"Projekt s key '{project_key}' nebyl nalezen nebo není viditelný pro účet v JIRA_EMAIL."
         )
 
     r.raise_for_status()
@@ -326,7 +321,6 @@ def jira_get_issue_type_name(project_key: str) -> str:
 
     issue_types = data.get("issueTypes", [])
     names = [it.get("name") for it in issue_types if it.get("name")]
-
     if not names:
         raise RuntimeError("Projekt je dostupný, ale nevrátil žádné issueTypes.")
 
@@ -389,6 +383,8 @@ def main():
     require_env("JIRA_EMAIL")
     require_env("JIRA_API_TOKEN")
     require_env("JIRA_PROJECT_KEY")
+
+    jira_diagnostic()
 
     processed = load_state()
 
