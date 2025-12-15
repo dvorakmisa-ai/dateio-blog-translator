@@ -343,8 +343,13 @@ def jira_get_issue_type_name(project_key: str) -> str:
 
     # 2) preferované typy (podle tvého projektu)
     preferred = [
+        "Článek",
         "Platform content",
-      
+        "Tapix content",
+        "Epic",
+        "Task",
+        "Úkol",
+        "Story",
     ]
 
     for p in preferred:
