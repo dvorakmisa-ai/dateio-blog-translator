@@ -276,7 +276,7 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
 def jira_create_issue(summary: str, description_adf: dict) -> str:
     project_key = require_env("JIRA_PROJECT_KEY").strip().strip('"').strip("'")
-    issue_type = os.getenv("JIRA_ISSUE_TYPE", "Platform content")  # override in Secrets/env if needed
+    issue_type = os.getenv("JIRA_ISSUE_TYPE", "Task")  # override in Secrets/env if needed
 
     payload = {
         "fields": {
