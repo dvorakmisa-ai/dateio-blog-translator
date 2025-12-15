@@ -320,7 +320,13 @@ def jira_get_issue_type_name(project_key: str) -> str:
     data = r.json()
 
     issue_types = data.get("issueTypes", [])
-    names = [it.get("name") for it in issue_types if it.get("name")]
+# vyhoď sub-task typy (vyžadují parent)
+non_subtasks = [
+    it for it in issue_types
+    if it.get("name") and not it.get("subtask", False)
+]
+names = [it["name"] for it in non_subtasks]
+
     if not names:
         raise RuntimeError("Projekt je dostupný, ale nevrátil žádné issueTypes.")
 
@@ -332,7 +338,7 @@ def jira_get_issue_type_name(project_key: str) -> str:
             return desired
         print(f"Pozor: JIRA_ISSUE_TYPE='{desired}' není validní pro projekt. Použiju fallback.")
 
-    preferred = ["Úkol", "Task", "Story", "Bug", "Request", "Service Request"]
+    preferred = ["Platform content"]
     for p in preferred:
         if p in names:
             print("Vybraný issue type (fallback):", p)
