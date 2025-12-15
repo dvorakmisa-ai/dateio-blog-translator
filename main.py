@@ -159,8 +159,16 @@ def jira_create_issue(summary: str, description: str) -> str:
         headers={"Accept": "application/json"},
         timeout=30,
     )
+   if r.status_code >= 400:
+    print("JIRA CREATE ISSUE ERROR:", r.status_code)
+    try:
+        print(r.json())
+    except Exception:
+        print(r.text)
     r.raise_for_status()
-    return r.json()["key"]
+
+return r.json()["key"]
+
 
 
 def jira_attach_file(issue_key: str, filename: str, content: bytes) -> None:
