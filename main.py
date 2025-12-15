@@ -16,6 +16,20 @@ STATE_FILE = "state.json"
 
 
 # ======================
+# ENV helper (blbě-odolný)
+# ======================
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"Chybí proměnná prostředí {name}. "
+            f"V GitHub Actions musí být v jobu:\n"
+            f"{name}: ${{{{ secrets.{name} }}}}"
+        )
+    return value
+
+
+# ======================
 # STATE (už zpracované URL)
 # ======================
 def load_state() -> set[str]:
@@ -68,11 +82,6 @@ def extract_post_urls_from_index(index_html: str) -> list[str]:
 # DETAIL ČLÁNKU → TEXT
 # ======================
 def extract_article_text(article_html: str, article_url: str) -> dict:
-    """
-    Jednoduchá extrakce:
-    - title: první <h1> nebo <title>
-    - body: text z <p>
-    """
     soup = BeautifulSoup(article_html, "html.parser")
 
     title = "Untitled"
@@ -125,16 +134,12 @@ Pravidla:
 
 
 # ======================
-# MS TEAMS – Webhook zpráva
+# MS TEAMS – Webhook
 # ======================
 def send_message_to_teams(title: str, article_url: str, translation_md: str) -> None:
-    """
-    Pošle zprávu do Teams přes Incoming Webhook.
-    Pozn.: Teams má limit délky zprávy, proto posíláme zkrácený výřez + odkaz.
-    """
-    webhook_url = os.environ["TEAMS_WEBHOOK_URL"].strip()
+    webhook_url = require_env("TEAMS_WEBHOOK_URL").strip()
 
-    # Zabráníme příliš dlouhé zprávě (Teams limit se může lišit)
+    # Teams má limit délky zprávy – zkrátíme
     max_chars = 3500
     snippet = translation_md
     if len(snippet) > max_chars:
@@ -169,6 +174,10 @@ def send_message_to_teams(title: str, article_url: str, translation_md: str) -> 
 # MAIN
 # ======================
 def main():
+    # povinné proměnné (fail fast)
+    require_env("OPENAI_API_KEY")
+    require_env("TEAMS_WEBHOOK_URL")
+
     processed = load_state()
 
     index_html = fetch_html(BLOG_INDEX)
@@ -178,10 +187,10 @@ def main():
 
     if not new_urls:
         print("Žádné nové články.")
-        save_state(processed)  # vždy vytvoří state.json
+        save_state(processed)
         return
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = OpenAI(api_key=require_env("OPENAI_API_KEY"))
 
     for url in new_urls:
         article_html = fetch_html(url)
@@ -192,9 +201,10 @@ def main():
             processed.add(url)
             continue
 
-        translation = translate_to_hungarian(client, article["title"], article["body"])
+        translation = translate_to_hungarian(
+            client, article["title"], article["body"]
+        )
 
-        # (volitelné) slug jen pro hezké logy / budoucí ukládání souborů
         slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", url.split("/")[-1]).strip("-")
 
         send_message_to_teams(
