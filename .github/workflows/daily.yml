@@ -1,9 +1,12 @@
-name: Daily blog translate to HU and post to Teams
+name: Daily blog translate to HU, save DOCX to repo, post link to Teams
 
 on:
   schedule:
-    - cron: "15 6 * * *"   # každý den 06:15 UTC
+    - cron: "15 6 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run:
@@ -11,6 +14,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,11 +34,3 @@ jobs:
           OPENAI_MODEL: gpt-4.1-mini
         run: |
           python main.py
-
-      - name: Upload state.json as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: state
-          path: state.json
-          if-no-files-found: ignore
