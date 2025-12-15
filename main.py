@@ -121,39 +121,64 @@ Pravidla:
 # ----------------------
 def jira_get_valid_issue_type_name() -> str:
     """
-    Zjistí, jaké issue typy jsou povolené pro daný projekt,
-    a vrátí jeden validní název (preferuje Task/Úkol/Story/Bug).
+    Zjistí validní issue type pro daný projekt přes:
+      GET /rest/api/3/project/{projectKeyOrId}?expand=issueTypes
+    Když projekt neexistuje / není přístupný, vypíše projekty dostupné pro daný účet
+    přes /rest/api/3/project/search.
     """
     base = os.environ["JIRA_BASE_URL"].rstrip("/")
     email = os.environ["JIRA_EMAIL"]
     token = os.environ["JIRA_API_TOKEN"]
-    project = os.environ["JIRA_PROJECT_KEY"]
 
-    url = f"{base}/rest/api/3/issue/createmeta"
+    # Očista project key (častý problém: mezery / uvozovky)
+    project = os.environ["JIRA_PROJECT_KEY"].strip().strip('"').strip("'")
 
+    # 1) Zkusíme načíst projekt + issue types
+    project_url = f"{base}/rest/api/3/project/{project}"
     r = requests.get(
-        url,
+        project_url,
         auth=(email, token),
         headers={"Accept": "application/json"},
-        params={"projectKeys": project, "expand": "projects.issuetypes"},
+        params={"expand": "issueTypes"},
         timeout=30,
     )
-    r.raise_for_status()
+
+    if r.status_code >= 400:
+        print("JIRA PROJECT LOOKUP ERROR")
+        print("Status code:", r.status_code)
+        try:
+            print("Response JSON:", r.json())
+        except Exception:
+            print("Response text:", r.text)
+
+        # 2) Debug pomoc: vypíšeme projekty, které účet vidí
+        print("\nViditelné projekty pro tento účet (project keys):")
+        search_url = f"{base}/rest/api/3/project/search"
+        s = requests.get(
+            search_url,
+            auth=(email, token),
+            headers={"Accept": "application/json"},
+            params={"maxResults": 50},
+            timeout=30,
+        )
+        if s.status_code < 400:
+            data = s.json()
+            for p in data.get("values", []):
+                print("-", p.get("key"), ":", p.get("name"))
+        else:
+            print("(Nepodařilo se vypsat projekty přes /project/search.)")
+
+        r.raise_for_status()
+
     data = r.json()
+    issue_types = data.get("issueTypes", [])
 
-    projects = data.get("projects", [])
-    if not projects:
+    if not issue_types:
         raise RuntimeError(
-            "Jira createmeta nevrátil žádný projekt. Zkontroluj JIRA_PROJECT_KEY."
+            "Projekt je dostupný, ale nevrátil žádné issueTypes (zkontroluj oprávnění / typ projektu)."
         )
 
-    issuetypes = projects[0].get("issuetypes", [])
-    if not issuetypes:
-        raise RuntimeError(
-            "Jira createmeta nevrátil žádné issue typy pro tento projekt."
-        )
-
-    available = [it.get("name") for it in issuetypes if it.get("name")]
+    available = [it.get("name") for it in issue_types if it.get("name")]
 
     preferred = ["Task", "Úkol", "Story", "Bug"]
     for name in preferred:
@@ -161,6 +186,7 @@ def jira_get_valid_issue_type_name() -> str:
             return name
 
     return available[0]
+
 
 
 def jira_already_has_issue_for_url(article_url: str) -> bool:
