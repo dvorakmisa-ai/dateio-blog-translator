@@ -173,13 +173,19 @@ def jira_create_issue(summary: str, description: str) -> str:
     token = os.environ["JIRA_API_TOKEN"]
     project = os.environ["JIRA_PROJECT_KEY"]
 
+    issue_type_name = jira_get_valid_issue_type_name()
+
+
     url = f"{base}/rest/api/3/issue"
 
     payload = {
         "fields": {
             "project": {"key": project},
             "summary": summary,
-            "issuetype": {"name": "Task"},
+            issue_type_name = jira_get_valid_issue_type_name()
+            ...
+            "issuetype": {"name": issue_type_name},
+
             "labels": ["dateio-auto-translate"],
             "description": {
                 "type": "doc",
