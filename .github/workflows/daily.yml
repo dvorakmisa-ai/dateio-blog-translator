@@ -24,13 +24,15 @@ jobs:
 
       - name: Run translator
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
-          JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }} # volitelné; když není, použije se "Task"
-          OPENAI_MODEL: gpt-4.1-mini
+          env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+  JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+  JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+  JIRA_ISSUE_TYPE: ${{ secrets.JIRA_ISSUE_TYPE }} # volitelné
+  JIRA_DIAGNOSTIC: ${{ secrets.JIRA_DIAGNOSTIC }} # volitelné (dej "1" když chceš diagnostiku)
+  OPENAI_MODEL: gpt-4.1-mini
         run: |
           python main.py
 
