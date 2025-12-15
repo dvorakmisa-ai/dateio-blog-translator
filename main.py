@@ -1,34 +1,42 @@
 import os
 import re
 import json
+import subprocess
+from datetime import datetime
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
+from docx import Document
 
 
 BLOG_INDEX = "https://www.dateioplatform.com/resources/blog"
 STATE_FILE = "state.json"
 
+# Kam ukládat Word soubory v repozitáři:
+OUTPUT_DIR = "translations/HU"
 
-# ======================
-# ENV helper
-# ======================
+
+# ----------------------
+# Helpers
+# ----------------------
 def require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise RuntimeError(
             f"Chybí proměnná prostředí {name}. "
-            f"V GitHub Actions musí být v jobu:\n"
-            f"{name}: ${{{{ secrets.{name} }}}}"
+            f"V GitHub Actions ji předej přes env: {name}: ${{{{ secrets.{name} }}}}"
         )
     return value
 
 
-# ======================
-# STATE
-# ======================
+def fetch_html(url: str) -> str:
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.text
+
+
 def load_state() -> set[str]:
     if not os.path.exists(STATE_FILE):
         return set()
@@ -39,49 +47,22 @@ def load_state() -> set[str]:
 
 def save_state(processed_urls: set[str]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"processed_urls": sorted(processed_urls)},
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump({"processed_urls": sorted(processed_urls)}, f, ensure_ascii=False, indent=2)
 
 
-# ======================
-# HTTP
-# ======================
-def fetch_html(url: str) -> str:
-    r = requests.get(
-        url,
-        timeout=30,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    r.raise_for_status()
-    return r.text
-
-
-# ======================
-# BLOG INDEX → POST URLS
-# ======================
 def extract_post_urls_from_index(index_html: str) -> list[str]:
     soup = BeautifulSoup(index_html, "html.parser")
     urls = set()
-
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         if "/resources/post/" in href:
             urls.add(urljoin(BLOG_INDEX, href))
-
     return sorted(urls)
 
 
-# ======================
-# ARTICLE → CONTENT + META
-# ======================
-def extract_article_text(article_html: str, article_url: str) -> dict:
+def extract_article(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "html.parser")
 
-    # Visible title (H1 preferred)
     title = "Untitled"
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
@@ -89,7 +70,7 @@ def extract_article_text(article_html: str, article_url: str) -> dict:
     elif soup.title and soup.title.get_text(strip=True):
         title = soup.title.get_text(strip=True)
 
-    # Meta title (OG preferred, fallback to <title>)
+    # meta title: og:title -> <title>
     meta_title = None
     og_title = soup.find("meta", attrs={"property": "og:title"})
     if og_title and og_title.get("content"):
@@ -97,17 +78,16 @@ def extract_article_text(article_html: str, article_url: str) -> dict:
     elif soup.title and soup.title.get_text(strip=True):
         meta_title = soup.title.get_text(strip=True)
 
-    # Meta description (description preferred, fallback to OG)
+    # meta description: description -> og:description
     meta_description = None
-    meta_desc_tag = soup.find("meta", attrs={"name": "description"})
-    if meta_desc_tag and meta_desc_tag.get("content"):
-        meta_description = meta_desc_tag["content"].strip()
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    if meta_desc and meta_desc.get("content"):
+        meta_description = meta_desc["content"].strip()
     else:
         og_desc = soup.find("meta", attrs={"property": "og:description"})
         if og_desc and og_desc.get("content"):
             meta_description = og_desc["content"].strip()
 
-    # Body (simple: all <p>)
     paragraphs = [
         p.get_text(" ", strip=True)
         for p in soup.find_all("p")
@@ -124,229 +104,200 @@ def extract_article_text(article_html: str, article_url: str) -> dict:
     }
 
 
-# ======================
-# OPENAI – TRANSLATION (incl. meta)
-# ======================
-def translate_to_hungarian(
-    client: OpenAI,
-    title: str,
-    meta_title: str | None,
-    meta_description: str | None,
-    body: str,
-) -> dict:
+def translate_to_hungarian(client: OpenAI, article: dict) -> dict:
     prompt = f"""
 Přelož následující obsah do maďarštiny.
 
-Vrať výstup POUZE jako JSON v tomto tvaru:
+Vrať výstup POUZE jako JSON:
 {{
   "title": "...",
   "meta_title": "...",
   "meta_description": "...",
-  "body": "..."
+  "body": "..."   // Markdown
 }}
 
 Pravidla:
 - zachovej význam a marketingový tón
-- meta_title: ideálně do 60 znaků
-- meta_description: ideálně do 160 znaků
+- meta_title ideálně do 60 znaků
+- meta_description ideálně do 160 znaků
 - body vrať v Markdownu, zachovej odstavce
-- pokud meta_title nebo meta_description chybí, navrhni je (na základě obsahu)
-- nevkládej do JSON žádné další klíče ani komentáře
+- pokud meta_title nebo meta_description chybí, navrhni je
+- žádné jiné klíče, žádné komentáře
 
 # TITLE
-{title}
+{article["title"]}
 
 # META TITLE
-{meta_title or ""}
+{article.get("meta_title") or ""}
 
 # META DESCRIPTION
-{meta_description or ""}
+{article.get("meta_description") or ""}
 
 # BODY
-{body}
+{article["body"]}
 """.strip()
 
-    response = client.responses.create(
+    resp = client.responses.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         input=prompt,
     )
-
-    text = response.output_text.strip()
+    text = resp.output_text.strip()
 
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # fallback: když model náhodou přidá text navíc, zkusíme vytáhnout JSON blok
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not m:
             raise RuntimeError(f"Model nevrátil validní JSON. Výstup:\n{text}")
         return json.loads(m.group(0))
 
 
-# ======================
-# TEAMS – chunking + send
-# ======================
-def split_into_chunks(text: str, max_chars: int) -> list[str]:
-    text = (text or "").strip()
-    if len(text) <= max_chars:
-        return [text] if text else [""]
+def markdownish_to_docx_paragraphs(doc: Document, body_md: str) -> None:
+    # Jednoduchý převod: rozdělení po odstavcích, odstranění # headingů
+    body_md = (body_md or "").strip()
+    if not body_md:
+        doc.add_paragraph("(empty)")
+        return
 
-    chunks = []
-    start = 0
-    n = len(text)
-
-    while start < n:
-        end = min(start + max_chars, n)
-
-        # prefer break on paragraph end
-        cut = text.rfind("\n\n", start, end)
-        if cut == -1 or cut <= start + int(max_chars * 0.6):
-            cut = text.rfind("\n", start, end)
-
-        if cut == -1 or cut <= start + int(max_chars * 0.6):
-            cut = end
-
-        chunk = text[start:cut].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        start = cut
-
-    return chunks
+    for block in body_md.split("\n\n"):
+        t = block.strip()
+        if not t:
+            continue
+        t = re.sub(r"^#{1,6}\s+", "", t)  # remove markdown headings
+        doc.add_paragraph(t)
 
 
-def send_message_to_teams_intro(
-    title_hu: str,
-    meta_title_hu: str,
-    meta_description_hu: str,
-    article_url: str,
-) -> None:
-    webhook_url = require_env("TEAMS_WEBHOOK_URL").strip()
+def build_docx_file(original: dict, hu: dict, out_path: str) -> None:
+    doc = Document()
+    doc.add_heading((hu.get("title") or original["title"]).strip(), level=1)
 
+    doc.add_paragraph(f"Originál: {original['url']}")
+    doc.add_paragraph("")
+
+    doc.add_heading("SEO meta (HU)", level=2)
+    doc.add_paragraph(f"Meta title: {(hu.get('meta_title') or '').strip()}")
+    doc.add_paragraph(f"Meta description: {(hu.get('meta_description') or '').strip()}")
+
+    doc.add_paragraph("")
+    doc.add_heading("Obsah (HU)", level=2)
+    markdownish_to_docx_paragraphs(doc, hu.get("body") or "")
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    doc.save(out_path)
+
+
+def run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def git_commit_and_push(file_paths: list[str], message: str) -> bool:
+    """
+    Vrátí True, pokud se něco commitlo. False pokud nebyly změny.
+    """
+    # Nastavení identity
+    run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
+    run(["git", "config", "user.name", "github-actions[bot]"])
+
+    # Add files
+    run(["git", "add", *file_paths])
+
+    # Pokud není co commitnout, git commit skončí s code 1 – ošetříme
+    res = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
+    if res.returncode != 0:
+        # typicky: "nothing to commit"
+        out = (res.stdout or "") + "\n" + (res.stderr or "")
+        if "nothing to commit" in out.lower():
+            return False
+        raise RuntimeError(f"git commit failed:\n{out}")
+
+    # Push (použije credentials z actions/checkout)
+    run(["git", "push"])
+    return True
+
+
+def github_blob_url(repo: str, branch: str, path: str) -> str:
+    # repo = "owner/name"
+    return f"https://github.com/{repo}/blob/{branch}/{path}"
+
+
+def send_teams_message(title_hu: str, meta_title_hu: str, meta_desc_hu: str, original_url: str, file_url: str) -> None:
+    webhook = require_env("TEAMS_WEBHOOK_URL").strip()
     payload = {
         "text": (
-            "📄 **Nový blog přeložen do maďarštiny (včetně meta)**\n\n"
+            "📄 **HU překlad blogu – Word soubor**\n\n"
             f"**Název (HU):** {title_hu}\n\n"
             f"**Meta title (HU):** {meta_title_hu}\n\n"
-            f"**Meta description (HU):** {meta_description_hu}\n\n"
-            f"🔗 **Originál:** {article_url}\n\n"
-            "👇 Překlad obsahu je v následujících zprávách."
+            f"**Meta description (HU):** {meta_desc_hu}\n\n"
+            f"🔗 **Originál:** {original_url}\n\n"
+            f"📎 **DOCX v repu:** {file_url}\n"
         )
     }
-
-    r = requests.post(
-        webhook_url,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
-
+    r = requests.post(webhook, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
     if r.status_code >= 400:
-        print("TEAMS WEBHOOK ERROR (INTRO)")
-        print("Status code:", r.status_code)
-        print("Response text:", r.text)
-
+        print("TEAMS ERROR:", r.status_code, r.text)
     r.raise_for_status()
 
 
-def send_message_to_teams_parts(
-    title_hu: str,
-    article_url: str,
-    body_md: str,
-) -> None:
-    webhook_url = require_env("TEAMS_WEBHOOK_URL").strip()
-
-    max_chars = 3500
-    parts = split_into_chunks(body_md, max_chars=max_chars)
-    total = len(parts)
-
-    for i, part in enumerate(parts, start=1):
-        header = (
-            f"📄 **Překlad (HU) – část {i}/{total}**\n\n"
-            f"**Název (HU):** {title_hu}\n\n"
-            f"🔗 **Originál:** {article_url}\n\n"
-            "---\n\n"
-        )
-
-        payload = {"text": header + part}
-
-        r = requests.post(
-            webhook_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-
-        if r.status_code >= 400:
-            print("TEAMS WEBHOOK ERROR (PART)")
-            print("Status code:", r.status_code)
-            print("Response text:", r.text)
-
-        r.raise_for_status()
-
-
-# ======================
-# MAIN
-# ======================
 def main():
     require_env("OPENAI_API_KEY")
     require_env("TEAMS_WEBHOOK_URL")
+
+    # GitHub kontext (Actions to nastavuje automaticky)
+    repo = require_env("GITHUB_REPOSITORY")        # "owner/repo"
+    branch = os.getenv("GITHUB_REF_NAME", "main")  # často "main"
 
     processed = load_state()
 
     index_html = fetch_html(BLOG_INDEX)
     post_urls = extract_post_urls_from_index(index_html)
-
     new_urls = [u for u in post_urls if u not in processed]
 
     if not new_urls:
         print("Žádné nové články.")
-        save_state(processed)
+        save_state(processed)  # vždy vytvoří state.json
         return
 
     client = OpenAI(api_key=require_env("OPENAI_API_KEY"))
 
     for url in new_urls:
         article_html = fetch_html(url)
-        article = extract_article_text(article_html, url)
+        article = extract_article(article_html, url)
 
         if not article["body"]:
             print(f"Nelze extrahovat text: {url}")
             processed.add(url)
             continue
 
-        translated = translate_to_hungarian(
-            client=client,
-            title=article["title"],
-            meta_title=article.get("meta_title"),
-            meta_description=article.get("meta_description"),
-            body=article["body"],
-        )
+        hu = translate_to_hungarian(client, article)
 
-        # Normalizace (kdyby model vrátil prázdné)
-        title_hu = (translated.get("title") or article["title"]).strip()
-        meta_title_hu = (translated.get("meta_title") or "").strip()
-        meta_description_hu = (translated.get("meta_description") or "").strip()
-        body_hu = (translated.get("body") or "").strip()
-
-        # Intro message with meta
-        send_message_to_teams_intro(
-            title_hu=title_hu,
-            meta_title_hu=meta_title_hu,
-            meta_description_hu=meta_description_hu,
-            article_url=url,
-        )
-
-        # Body in parts
-        send_message_to_teams_parts(
-            title_hu=title_hu,
-            article_url=url,
-            body_md=body_hu,
-        )
-
+        # Sestavení názvu souboru
         slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", url.split("/")[-1]).strip("-")
-        print(f"Odesláno do Teams (meta+parts): {slug}")
+        dt = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{dt}-{slug}-HU.docx"
 
+        rel_path = f"{OUTPUT_DIR}/{filename}"
+        out_path = os.path.join(os.getcwd(), rel_path)
+
+        build_docx_file(article, hu, out_path)
+
+        # commit + push docx + state
+        save_state(processed | {url})
+        committed = git_commit_and_push(
+            [rel_path, STATE_FILE],
+            message=f"Add HU translation DOCX: {filename}",
+        )
+
+        file_url = github_blob_url(repo, branch, rel_path)
+
+        send_teams_message(
+            title_hu=(hu.get("title") or article["title"]).strip(),
+            meta_title_hu=(hu.get("meta_title") or "").strip(),
+            meta_desc_hu=(hu.get("meta_description") or "").strip(),
+            original_url=url,
+            file_url=file_url,
+        )
+
+        print(f"Hotovo: {rel_path} (committed={committed})")
         processed.add(url)
 
     save_state(processed)
