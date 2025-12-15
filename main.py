@@ -294,9 +294,9 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
 def jira_get_issue_type_name(project_key: str) -> str:
     """
-    Gets valid issue type for the project via:
-      GET /rest/api/3/project/{key}?expand=issueTypes
-    If the project isn't visible (404), we raise a clear error.
+    Zjistí validní issue type pro projekt.
+    - ignoruje sub-task typy (vyžadují parent)
+    - preferuje doménové typy jako 'Článek'
     """
     desired = (os.getenv("JIRA_ISSUE_TYPE") or "").strip()
     project_key = (project_key or "").strip().strip('"').strip("'")
@@ -320,31 +320,45 @@ def jira_get_issue_type_name(project_key: str) -> str:
     data = r.json()
 
     issue_types = data.get("issueTypes", [])
-# vyhoď sub-task typy (vyžadují parent)
-non_subtasks = [
-    it for it in issue_types
-    if it.get("name") and not it.get("subtask", False)
-]
-names = [it["name"] for it in non_subtasks]
 
-    if not names:
-        raise RuntimeError("Projekt je dostupný, ale nevrátil žádné issueTypes.")
+    # vyřadíme sub-task typy (potřebují parent issue)
+    non_subtasks = [
+        it for it in issue_types
+        if it.get("name") and not it.get("subtask", False)
+    ]
 
-    print("Dostupné issue types v projektu:", ", ".join(names))
+    if not non_subtasks:
+        raise RuntimeError("Projekt nemá žádný non-subtask issue type.")
 
+    names = [it["name"] for it in non_subtasks]
+    print("Dostupné issue types (bez sub-task):", ", ".join(names))
+
+    # 1) explicitní override ze secretu
     if desired:
         if desired in names:
             print("Používám issue type z JIRA_ISSUE_TYPE:", desired)
             return desired
-        print(f"Pozor: JIRA_ISSUE_TYPE='{desired}' není validní pro projekt. Použiju fallback.")
+        else:
+            print(f"JIRA_ISSUE_TYPE='{desired}' není validní pro projekt.")
 
-    preferred = ["Platform content"]
+    # 2) preferované typy (podle tvého projektu)
+    preferred = [
+        "Článek",
+        "Platform content",
+        "Tapix content",
+        "Epic",
+        "Task",
+        "Úkol",
+        "Story",
+    ]
+
     for p in preferred:
         if p in names:
-            print("Vybraný issue type (fallback):", p)
+            print("Vybraný issue type (preferred):", p)
             return p
 
-    print("Vybraný issue type (first):", names[0])
+    # 3) fallback – první dostupný non-subtask typ
+    print("Vybraný issue type (fallback):", names[0])
     return names[0]
 
 
