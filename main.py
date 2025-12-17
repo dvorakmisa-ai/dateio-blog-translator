@@ -60,7 +60,7 @@ def extract_post_urls_from_index(index_html: str) -> list[str]:
     return sorted(urls)
 
 
-# ===== NEW: structured HTML -> md-ish (headings, lists, bold, links) =====
+# ===== Structured HTML -> md-ish (headings, lists, bold, links, images) =====
 def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
@@ -111,6 +111,22 @@ def _inline_to_mdish(node: Tag, base_url: str) -> str:
     return out.strip()
 
 
+def _img_src_from_tag(img: Tag) -> str:
+    """
+    Try common src attributes including lazy-load variants.
+    """
+    if not img:
+        return ""
+    for key in ("src", "data-src", "data-original", "data-lazy-src", "data-srcset"):
+        v = (img.get(key) or "").strip()
+        if v:
+            # srcset can contain multiple urls; pick first
+            if key.endswith("srcset") and "," in v:
+                v = v.split(",")[0].strip().split(" ")[0].strip()
+            return v
+    return ""
+
+
 def _html_to_mdish(root: Tag, base_url: str) -> str:
     """
     Block HTML -> md-ish with explicit heading labels:
@@ -118,13 +134,32 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
       H2: ...
       - bullet
       1. numbered
+      IMG1: alt="..." caption="..." src=...
     Keeps inline **bold**, *italic*, and [text](url).
     """
     blocks: list[str] = []
+    img_counter = {"n": 0}
+
+    def add_image_placeholder(img: Tag, caption: str = ""):
+        img_counter["n"] += 1
+        src = _img_src_from_tag(img)
+        alt = _norm_ws(img.get("alt") or "") if img else ""
+        abs_src = urljoin(base_url, src) if src else ""
+
+        parts = [f"IMG{img_counter['n']}:"]
+        if alt:
+            parts.append(f'alt="{alt}"')
+        if caption:
+            parts.append(f'caption="{_norm_ws(caption)}"')
+        if abs_src:
+            parts.append(f"src={abs_src}")
+
+        blocks.append(" ".join(parts))
 
     def handle(el: Tag, indent: int = 0):
         name = (el.name or "").lower()
 
+        # Headings
         if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
             level = int(name[1])
             text = _norm_ws(el.get_text(" ", strip=True))
@@ -132,18 +167,33 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 blocks.append(f"H{level}: {text}")
             return
 
+        # Figure with img + caption
+        if name == "figure":
+            img = el.find("img")
+            if img:
+                cap_el = el.find("figcaption")
+                caption = cap_el.get_text(" ", strip=True) if cap_el else ""
+                add_image_placeholder(img, caption=caption)
+            return
+
+        # Standalone img
+        if name == "img":
+            add_image_placeholder(el, caption="")
+            return
+
+        # Paragraph
         if name == "p":
             text = _inline_to_mdish(el, base_url).strip()
             if text:
                 blocks.append(text)
             return
 
+        # Lists
         if name == "ul":
             for li in el.find_all("li", recursive=False):
                 txt = _norm_ws(_inline_to_mdish(li, base_url))
                 if txt:
                     blocks.append(("  " * indent) + f"- {txt}")
-                # nested lists directly under li
                 for child in li.find_all(["ul", "ol"], recursive=False):
                     handle(child, indent=indent + 1)
             return
@@ -159,26 +209,26 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                     handle(child, indent=indent + 1)
             return
 
-        # containers: keep order by iterating direct children
+        # Containers: keep order by iterating direct children
         for child in el.find_all(recursive=False):
             if isinstance(child, Tag):
                 handle(child, indent=indent)
 
-    # walk direct children to reduce picking up nav/footer noise
+    # Walk direct children to reduce picking up nav/footer noise
     for child in root.find_all(recursive=False):
         if isinstance(child, Tag):
             handle(child, indent=0)
 
-    # join as paragraphs separated by blank lines
+    # Join as paragraphs separated by blank lines
     out: list[str] = []
     for b in blocks:
         # keep list prefix formatting intact
-        if b.lstrip().startswith("-") or re.match(r"^\s*\d+\.\s+", b):
+        if b.lstrip().startswith("-") or re.match(r"^\s*\d+\.\s+", b) or re.match(r"^IMG\d+:\s+", b):
             out.append(b.rstrip())
         else:
             out.append(_norm_ws(b))
     return "\n\n".join([x for x in out if x.strip()]).strip()
-# ===== END NEW =====
+# ===== END structured parsing =====
 
 
 def extract_article(article_html: str, article_url: str) -> dict:
@@ -210,12 +260,12 @@ def extract_article(article_html: str, article_url: str) -> dict:
         if og_desc and og_desc.get("content"):
             meta_description = og_desc["content"].strip()
 
-    # ===== CHANGED: structured body instead of all <p> =====
+    # Body: structured parse with fallback
     content_root = soup.find("article") or soup.select_one("main") or soup.body
     body = ""
     if content_root:
         body = _html_to_mdish(content_root, article_url).strip()
-    # fallback (just in case)
+
     if not body:
         paragraphs = [
             p.get_text(" ", strip=True)
@@ -223,7 +273,6 @@ def extract_article(article_html: str, article_url: str) -> dict:
             if p.get_text(strip=True)
         ]
         body = "\n\n".join(paragraphs).strip()
-    # ===== END CHANGED =====
 
     return {
         "url": article_url,
@@ -259,6 +308,7 @@ Pravidla:
   - zachovej odrážky "- ..." a číslování "1. ..."
   - zachovej **tučné** a *kurzívu* (markdown značky)
   - zachovej odkazy ve formátu [text](URL); URL se NESMÍ měnit
+  - zachovej řádky začínající "IMG" (např. "IMG1: ...") – neupravuj je a nepřekládej URL/atributy
 - pokud meta_title nebo meta_description chybí, navrhni je z obsahu
 - žádné jiné klíče, žádné komentáře
 
@@ -305,7 +355,6 @@ def adf_heading(text: str, level: int = 2) -> dict:
     return {"type": "heading", "attrs": {"level": level}, "content": [adf_text(text)]}
 
 
-# ===== NEW: list helpers =====
 def adf_list_item(text: str) -> dict:
     return {"type": "listItem", "content": [adf_paragraph(text)]}
 
@@ -316,7 +365,6 @@ def adf_bullet_list(items: list[str]) -> dict:
 
 def adf_ordered_list(items: list[str]) -> dict:
     return {"type": "orderedList", "content": [adf_list_item(i) for i in items]}
-# ===== END NEW =====
 
 
 def mdish_to_adf_blocks(text: str) -> list[dict]:
@@ -326,6 +374,7 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
     - headings: "H2: ..." OR markdown "# ..."
     - bullet lists: lines starting "- "
     - ordered lists: lines "1. ..."
+    - image markers: "IMG1: ..."
     - everything else paragraph
     """
     blocks: list[dict] = []
@@ -338,34 +387,40 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
         if not b:
             continue
 
-        # NEW: "H2: Title"
+        # Headings "H2: ..."
         m_h = re.match(r"^H([1-6]):\s+(.*)$", b)
         if m_h:
             level = int(m_h.group(1))
             blocks.append(adf_heading(m_h.group(2).strip(), level=level))
             continue
 
-        # existing: "# Title"
+        # Markdown headings "# ..."
         m = re.match(r"^(#{1,6})\s+(.*)$", b)
         if m:
             level = min(6, max(1, len(m.group(1))))
             blocks.append(adf_heading(m.group(2).strip(), level=level))
             continue
 
+        # Image marker line
+        if re.match(r"^IMG\d+:\s+", b):
+            blocks.append(adf_paragraph("🖼️ " + b))
+            continue
+
         lines = [ln.rstrip() for ln in b.split("\n") if ln.strip()]
 
-        # NEW: bullet list
+        # Bullet list
         if lines and all(re.match(r"^\s*-\s+.+$", ln) for ln in lines):
             items = [re.sub(r"^\s*-\s+", "", ln).strip() for ln in lines]
             blocks.append(adf_bullet_list(items))
             continue
 
-        # NEW: ordered list
+        # Ordered list
         if lines and all(re.match(r"^\s*\d+\.\s+.+$", ln) for ln in lines):
             items = [re.sub(r"^\s*\d+\.\s+", "", ln).strip() for ln in lines]
             blocks.append(adf_ordered_list(items))
             continue
 
+        # Paragraph fallback
         b = re.sub(r"\n+", "\n", b)
         blocks.append(adf_paragraph(b))
 
