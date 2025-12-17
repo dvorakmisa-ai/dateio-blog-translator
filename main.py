@@ -5,6 +5,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from bs4.element import Tag, NavigableString
 from openai import OpenAI
 
 
@@ -59,6 +60,132 @@ def extract_post_urls_from_index(index_html: str) -> list[str]:
     return sorted(urls)
 
 
+def _normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _inline_to_md(node: Tag, base_url: str) -> str:
+    """
+    Inline HTML -> markdown-ish:
+    - <strong>/<b> => **text**
+    - <em>/<i> => *text*
+    - <a href> => [text](absolute_url)
+    - <br> => newline
+    """
+    def walk(n) -> str:
+        if isinstance(n, NavigableString):
+            return str(n)
+
+        if not isinstance(n, Tag):
+            return ""
+
+        name = (n.name or "").lower()
+
+        if name == "br":
+            return "\n"
+
+        if name in ("strong", "b"):
+            inner = _normalize_ws("".join(walk(c) for c in n.children))
+            return f"**{inner}**" if inner else ""
+
+        if name in ("em", "i"):
+            inner = _normalize_ws("".join(walk(c) for c in n.children))
+            return f"*{inner}*" if inner else ""
+
+        if name == "a":
+            href = (n.get("href") or "").strip()
+            text = _normalize_ws("".join(walk(c) for c in n.children)) or href
+            if href:
+                abs_href = urljoin(base_url, href)
+                return f"[{text}]({abs_href})"
+            return text
+
+        # default: recurse
+        return "".join(walk(c) for c in n.children)
+
+    out = walk(node)
+    # preserve newlines from <br>, but clean whitespace around them
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n[ \t]+", "\n", out)
+    return out.strip()
+
+
+def _html_to_mdish(root: Tag, base_url: str) -> str:
+    """
+    Block HTML -> markdown-ish with explicit heading labels:
+      H1: Title
+      H2: Subtitle
+      - bullet
+      1. numbered
+      > quote
+    Keeps inline **bold**, *italic*, and [text](url).
+    """
+    lines: list[str] = []
+
+    def handle_block(el: Tag, indent: int = 0):
+        name = (el.name or "").lower()
+
+        if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(name[1])
+            text = _normalize_ws(el.get_text(" ", strip=True))
+            if text:
+                lines.append(f"H{level}: {text}")
+            return
+
+        if name == "p":
+            text = _inline_to_md(el, base_url).strip()
+            if text:
+                lines.append(text)
+            return
+
+        if name == "blockquote":
+            text = _normalize_ws(el.get_text(" ", strip=True))
+            if text:
+                lines.append(f"> {text}")
+            return
+
+        if name == "ul":
+            for li in el.find_all("li", recursive=False):
+                txt = _normalize_ws(_inline_to_md(li, base_url))
+                if txt:
+                    lines.append(("  " * indent) + f"- {txt}")
+                # nested lists directly under li
+                for child in li.find_all(["ul", "ol"], recursive=False):
+                    handle_block(child, indent=indent + 1)
+            return
+
+        if name == "ol":
+            i = 1
+            for li in el.find_all("li", recursive=False):
+                txt = _normalize_ws(_inline_to_md(li, base_url))
+                if txt:
+                    lines.append(("  " * indent) + f"{i}. {txt}")
+                i += 1
+                for child in li.find_all(["ul", "ol"], recursive=False):
+                    handle_block(child, indent=indent + 1)
+            return
+
+        # container: walk direct children to keep order
+        for child in el.find_all(recursive=False):
+            if isinstance(child, Tag):
+                handle_block(child, indent=indent)
+
+    # walk direct children to avoid pulling nav/footer multiple times
+    for child in root.find_all(recursive=False):
+        if isinstance(child, Tag):
+            handle_block(child, indent=0)
+
+    # join blocks
+    out_lines: list[str] = []
+    for ln in lines:
+        # don't normalize list markers / quote markers too aggressively
+        if ln.lstrip().startswith(("-", ">")) or re.match(r"^\s*\d+\.\s+", ln):
+            out_lines.append(ln.rstrip())
+        else:
+            out_lines.append(_normalize_ws(ln))
+    return "\n\n".join([x for x in out_lines if x.strip()]).strip()
+
+
 def extract_article(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "html.parser")
 
@@ -88,13 +215,11 @@ def extract_article(article_html: str, article_url: str) -> dict:
         if og_desc and og_desc.get("content"):
             meta_description = og_desc["content"].strip()
 
-    # Body (simple: all <p>)
-    paragraphs = [
-        p.get_text(" ", strip=True)
-        for p in soup.find_all("p")
-        if p.get_text(strip=True)
-    ]
-    body = "\n\n".join(paragraphs).strip()
+    # Body: structured parse (headings, lists, bold, links)
+    content_root = soup.find("article") or soup.select_one("main") or soup.body
+    body = ""
+    if content_root:
+        body = _html_to_mdish(content_root, article_url).strip()
 
     return {
         "url": article_url,
@@ -125,6 +250,10 @@ Pravidla:
 - meta_title ideálně do 60 znaků
 - meta_description ideálně do 160 znaků
 - body nezkracuj, zachovej odstavce
+- zachovej strukturu a značky nadpisů přesně: řádky začínající "H1:", "H2:", ... musí zůstat a jen se přeloží text za dvojtečkou
+- zachovej odrážky a číslování (řádky "- ..." a "1. ...")
+- zachovej tučné písmo v Markdownu (**...**) a kurzívu (*...*)
+- zachovej odkazy ve formátu [text](URL); URL se NESMÍ měnit, text v hranatých závorkách se přeloží
 - pokud meta_title nebo meta_description chybí, navrhni je z obsahu
 - žádné jiné klíče, žádné komentáře
 
@@ -159,24 +288,141 @@ Pravidla:
 # -----------------------
 # Jira ADF helpers
 # -----------------------
-def adf_text(text: str) -> dict:
-    return {"type": "text", "text": text}
+def adf_text(text: str, marks: list[dict] | None = None) -> dict:
+    node = {"type": "text", "text": text}
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+def _adf_inline_from_mdish(text: str) -> list[dict]:
+    """
+    Parse a very small subset of markdown-ish inline:
+      **bold**
+      *italic*
+      [text](url)
+    Produces ADF text nodes with marks (strong/em/link).
+    """
+    text = text or ""
+    out: list[dict] = []
+
+    # split by links first
+    link_pat = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+    pos = 0
+    for m in link_pat.finditer(text):
+        if m.start() > pos:
+            out.extend(_adf_inline_parse_bold_italic(text[pos:m.start()]))
+
+        label = m.group(1)
+        href = m.group(2).strip()
+        if label:
+            out.append(adf_text(label, marks=[{"type": "link", "attrs": {"href": href}}]))
+        pos = m.end()
+
+    if pos < len(text):
+        out.extend(_adf_inline_parse_bold_italic(text[pos:]))
+
+    # merge adjacent plain nodes to keep ADF clean
+    merged: list[dict] = []
+    for n in out:
+        if (
+            merged
+            and merged[-1].get("type") == "text"
+            and n.get("type") == "text"
+            and merged[-1].get("marks") == n.get("marks")
+        ):
+            merged[-1]["text"] += n.get("text", "")
+        else:
+            merged.append(n)
+    return [n for n in merged if n.get("text")]
+
+
+def _adf_inline_parse_bold_italic(s: str) -> list[dict]:
+    """
+    Parses **bold** and *italic* in a segment without links.
+    Not a full markdown parser; good enough for web content.
+    """
+    nodes: list[dict] = []
+
+    i = 0
+    while i < len(s):
+        # bold
+        if s.startswith("**", i):
+            j = s.find("**", i + 2)
+            if j != -1:
+                inner = s[i + 2:j]
+                if inner:
+                    nodes.append(adf_text(inner, marks=[{"type": "strong"}]))
+                i = j + 2
+                continue
+
+        # italic (single *)
+        if s.startswith("*", i) and not s.startswith("**", i):
+            j = s.find("*", i + 1)
+            if j != -1:
+                inner = s[i + 1:j]
+                if inner:
+                    nodes.append(adf_text(inner, marks=[{"type": "em"}]))
+                i = j + 1
+                continue
+
+        # plain char run
+        # take until next marker
+        next_positions = []
+        nb = s.find("**", i)
+        ni = s.find("*", i)
+        if nb != -1:
+            next_positions.append(nb)
+        if ni != -1:
+            next_positions.append(ni)
+        nxt = min(next_positions) if next_positions else -1
+
+        if nxt == -1:
+            nodes.append(adf_text(s[i:]))
+            break
+        else:
+            if nxt > i:
+                nodes.append(adf_text(s[i:nxt]))
+            i = nxt
+
+    return nodes
 
 
 def adf_paragraph(text: str) -> dict:
-    return {"type": "paragraph", "content": [adf_text(text)]}
+    # normalize newlines inside paragraph to spaces; blocks are separated elsewhere
+    text = (text or "").replace("\n", " ").strip()
+    content = _adf_inline_from_mdish(text) if text else [adf_text("")]
+    return {"type": "paragraph", "content": content}
 
 
 def adf_heading(text: str, level: int = 2) -> dict:
-    return {"type": "heading", "attrs": {"level": level}, "content": [adf_text(text)]}
+    text = (text or "").strip()
+    content = _adf_inline_from_mdish(text) if text else [adf_text("")]
+    return {"type": "heading", "attrs": {"level": level}, "content": content}
+
+
+def adf_list_item(text: str) -> dict:
+    return {"type": "listItem", "content": [adf_paragraph(text)]}
+
+
+def adf_bullet_list(items: list[str]) -> dict:
+    return {"type": "bulletList", "content": [adf_list_item(i) for i in items]}
+
+
+def adf_ordered_list(items: list[str]) -> dict:
+    return {"type": "orderedList", "content": [adf_list_item(i) for i in items]}
 
 
 def mdish_to_adf_blocks(text: str) -> list[dict]:
     """
-    Very simple conversion:
-    - split into blocks by blank lines
-    - treat blocks starting with # as headings
-    - everything else as paragraphs
+    Conversion of our md-ish blocks:
+    - blocks separated by blank lines
+    - headings: "H2: ..." or "# ..."
+    - bullet list: lines "- ..."
+    - ordered list: lines "1. ..."
+    - quote: lines starting with "> "
+    - everything else paragraph
     """
     blocks: list[dict] = []
     text = (text or "").strip()
@@ -188,12 +434,42 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
         if not b:
             continue
 
+        # Headings "H2: ..."
+        m2 = re.match(r"^H([1-6]):\s+(.*)$", b)
+        if m2:
+            level = int(m2.group(1))
+            blocks.append(adf_heading(m2.group(2).strip(), level=level))
+            continue
+
+        # Markdown headings "# ..."
         m = re.match(r"^(#{1,6})\s+(.*)$", b)
         if m:
             level = min(6, max(1, len(m.group(1))))
             blocks.append(adf_heading(m.group(2).strip(), level=level))
             continue
 
+        # Quote
+        if all(ln.strip().startswith(">") for ln in b.split("\n") if ln.strip()):
+            # join quote lines into one paragraph (without >)
+            q = "\n".join([re.sub(r"^\s*>\s?", "", ln).rstrip() for ln in b.split("\n") if ln.strip()])
+            blocks.append({"type": "blockquote", "content": [adf_paragraph(q)]})
+            continue
+
+        lines = [ln.rstrip() for ln in b.split("\n") if ln.strip()]
+
+        # Bullet list
+        if lines and all(re.match(r"^\s*-\s+.+$", ln) for ln in lines):
+            items = [re.sub(r"^\s*-\s+", "", ln).strip() for ln in lines]
+            blocks.append(adf_bullet_list(items))
+            continue
+
+        # Ordered list
+        if lines and all(re.match(r"^\s*\d+\.\s+.+$", ln) for ln in lines):
+            items = [re.sub(r"^\s*\d+\.\s+", "", ln).strip() for ln in lines]
+            blocks.append(adf_ordered_list(items))
+            continue
+
+        # Paragraph fallback (keep soft line breaks as spaces)
         b = re.sub(r"\n+", "\n", b)
         blocks.append(adf_paragraph(b))
 
@@ -282,6 +558,7 @@ def jira_diagnostic() -> None:
 
 
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
+    # Keep your original logic for now (duplicates fix is a separate topic you postponed)
     jql = f'project = {project_key} AND labels = "dateio-auto-translate" AND text ~ "{article_url}"'
     r = jira_request(
         "GET",
@@ -321,7 +598,6 @@ def jira_get_issue_type_name(project_key: str) -> str:
 
     issue_types = data.get("issueTypes", [])
 
-    # vyřadíme sub-task typy (potřebují parent issue)
     non_subtasks = [
         it for it in issue_types
         if it.get("name") and not it.get("subtask", False)
@@ -333,7 +609,6 @@ def jira_get_issue_type_name(project_key: str) -> str:
     names = [it["name"] for it in non_subtasks]
     print("Dostupné issue types (bez sub-task):", ", ".join(names))
 
-    # 1) explicitní override ze secretu
     if desired:
         if desired in names:
             print("Používám issue type z JIRA_ISSUE_TYPE:", desired)
@@ -341,15 +616,8 @@ def jira_get_issue_type_name(project_key: str) -> str:
         else:
             print(f"JIRA_ISSUE_TYPE='{desired}' není validní pro projekt.")
 
-    # 2) preferované typy (podle tvého projektu)
     preferred = [
-        "Článek",
         "Platform content",
-        "Tapix content",
-        "Epic",
-        "Task",
-        "Úkol",
-        "Story",
     ]
 
     for p in preferred:
@@ -357,7 +625,6 @@ def jira_get_issue_type_name(project_key: str) -> str:
             print("Vybraný issue type (preferred):", p)
             return p
 
-    # 3) fallback – první dostupný non-subtask typ
     print("Vybraný issue type (fallback):", names[0])
     return names[0]
 
