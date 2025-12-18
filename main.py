@@ -101,11 +101,9 @@ def _inline_to_mdish(node: Tag, base_url: str) -> str:
                 return f"[{text}]({abs_href})"
             return text
 
-        # default: recurse
         return "".join(walk(c) for c in n.children)
 
     out = walk(node)
-    # keep <br> newlines, but clean whitespace around them
     out = re.sub(r"[ \t]+\n", "\n", out)
     out = re.sub(r"\n[ \t]+", "\n", out)
     return out.strip()
@@ -120,7 +118,6 @@ def _img_src_from_tag(img: Tag) -> str:
     for key in ("src", "data-src", "data-original", "data-lazy-src", "data-srcset"):
         v = (img.get(key) or "").strip()
         if v:
-            # srcset can contain multiple urls; pick first
             if key.endswith("srcset") and "," in v:
                 v = v.split(",")[0].strip().split(" ")[0].strip()
             return v
@@ -159,7 +156,6 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
     def handle(el: Tag, indent: int = 0):
         name = (el.name or "").lower()
 
-        # Headings
         if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
             level = int(name[1])
             text = _norm_ws(el.get_text(" ", strip=True))
@@ -167,7 +163,6 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 blocks.append(f"H{level}: {text}")
             return
 
-        # Figure with img + caption
         if name == "figure":
             img = el.find("img")
             if img:
@@ -176,19 +171,16 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 add_image_placeholder(img, caption=caption)
             return
 
-        # Standalone img
         if name == "img":
             add_image_placeholder(el, caption="")
             return
 
-        # Paragraph
         if name == "p":
             text = _inline_to_mdish(el, base_url).strip()
             if text:
                 blocks.append(text)
             return
 
-        # Lists
         if name == "ul":
             for li in el.find_all("li", recursive=False):
                 txt = _norm_ws(_inline_to_mdish(li, base_url))
@@ -209,26 +201,95 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                     handle(child, indent=indent + 1)
             return
 
-        # Containers: keep order by iterating direct children
         for child in el.find_all(recursive=False):
             if isinstance(child, Tag):
                 handle(child, indent=indent)
 
-    # Walk direct children to reduce picking up nav/footer noise
     for child in root.find_all(recursive=False):
         if isinstance(child, Tag):
             handle(child, indent=0)
 
-    # Join as paragraphs separated by blank lines
     out: list[str] = []
     for b in blocks:
-        # keep list prefix formatting intact
-        if b.lstrip().startswith("-") or re.match(r"^\s*\d+\.\s+", b) or re.match(r"^IMG\d+:\s+", b):
+        if (
+            b.lstrip().startswith("-")
+            or re.match(r"^\s*\d+\.\s+", b)
+            or re.match(r"^IMG\d+:\s+", b)
+        ):
             out.append(b.rstrip())
         else:
             out.append(_norm_ws(b))
     return "\n\n".join([x for x in out if x.strip()]).strip()
-# ===== END structured parsing =====
+
+
+# ===== NEW: FAQ extraction =====
+def extract_faqs(soup: BeautifulSoup) -> list[str]:
+    """
+    Extract FAQs as ordered Q/A blocks in md-ish form.
+    Tries schema.org FAQPage first; then common class/id patterns.
+    """
+    blocks: list[str] = []
+
+    # Find likely FAQ containers
+    faq_roots = []
+
+    # schema.org FAQPage anywhere
+    faq_roots.extend(soup.select('[itemtype*="FAQPage"]'))
+
+    # common ids/classes
+    faq_roots.extend(soup.select("#faq, #faqs, .faq, .faqs"))
+
+    # de-duplicate while preserving order
+    seen = set()
+    uniq_roots = []
+    for r in faq_roots:
+        rid = id(r)
+        if rid not in seen:
+            seen.add(rid)
+            uniq_roots.append(r)
+
+    if not uniq_roots:
+        return blocks
+
+    blocks.append("H2: FAQs")
+    q_idx = 1
+
+    for root in uniq_roots:
+        # Schema.org pattern: mainEntity -> name + acceptedAnswer
+        entities = root.select('[itemprop="mainEntity"]')
+        if entities:
+            for e in entities:
+                q = e.select_one('[itemprop="name"]')
+                a = e.select_one('[itemprop="acceptedAnswer"]')
+                if q and a:
+                    q_text = _norm_ws(q.get_text(" ", strip=True))
+                    a_text = _norm_ws(a.get_text(" ", strip=True))
+                    if q_text:
+                        blocks.append(f"FAQ Q{q_idx}: {q_text}")
+                        if a_text:
+                            blocks.append(f"FAQ A{q_idx}: {a_text}")
+                        q_idx += 1
+            continue
+
+        # Fallback: look for headings (h3/h4) followed by paragraph/div as answer
+        for h in root.find_all(["h3", "h4"], recursive=True):
+            q_text = _norm_ws(h.get_text(" ", strip=True))
+            if not q_text:
+                continue
+
+            # find a plausible answer node near it
+            ans = h.find_next_sibling(["p", "div"])
+            a_text = _norm_ws(ans.get_text(" ", strip=True)) if ans else ""
+
+            blocks.append(f"FAQ Q{q_idx}: {q_text}")
+            if a_text:
+                blocks.append(f"FAQ A{q_idx}: {a_text}")
+            q_idx += 1
+
+    # If we failed to find any Qs, return empty
+    has_any_q = any(b.startswith("FAQ Q") for b in blocks)
+    return blocks if has_any_q else []
+# ===== END FAQ extraction =====
 
 
 def extract_article(article_html: str, article_url: str) -> dict:
@@ -274,6 +335,12 @@ def extract_article(article_html: str, article_url: str) -> dict:
         ]
         body = "\n\n".join(paragraphs).strip()
 
+    # ===== NEW: Append FAQs (if found) =====
+    faq_blocks = extract_faqs(soup)
+    if faq_blocks:
+        body = (body + "\n\n" + "\n\n".join(faq_blocks)).strip()
+    # ===== END NEW =====
+
     return {
         "url": article_url,
         "title": title,
@@ -305,6 +372,7 @@ Pravidla:
 - body nezkracuj, zachovej odstavce
 - zachovej strukturu:
   - řádky začínající "H1:", "H2:", ... ponech a přelož jen text za dvojtečkou
+  - zachovej FAQ strukturu: řádky "FAQ Q1:", "FAQ A1:" ponech, přelož jen text za dvojtečkou
   - zachovej odrážky "- ..." a číslování "1. ..."
   - zachovej **tučné** a *kurzívu* (markdown značky)
   - zachovej odkazy ve formátu [text](URL); URL se NESMÍ měnit
@@ -375,6 +443,7 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
     - bullet lists: lines starting "- "
     - ordered lists: lines "1. ..."
     - image markers: "IMG1: ..."
+    - FAQ markers: "FAQ Q1:" / "FAQ A1:"
     - everything else paragraph
     """
     blocks: list[dict] = []
@@ -401,9 +470,14 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
             blocks.append(adf_heading(m.group(2).strip(), level=level))
             continue
 
-        # Image marker line
+        # Image marker
         if re.match(r"^IMG\d+:\s+", b):
             blocks.append(adf_paragraph("🖼️ " + b))
+            continue
+
+        # FAQ markers
+        if re.match(r"^FAQ\s+[QA]\d+:\s+", b):
+            blocks.append(adf_paragraph("❓ " + b))
             continue
 
         lines = [ln.rstrip() for ln in b.split("\n") if ln.strip()]
@@ -420,7 +494,6 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
             blocks.append(adf_ordered_list(items))
             continue
 
-        # Paragraph fallback
         b = re.sub(r"\n+", "\n", b)
         blocks.append(adf_paragraph(b))
 
@@ -483,10 +556,6 @@ def jira_request(method: str, path: str, **kwargs) -> requests.Response:
 
 
 def jira_diagnostic() -> None:
-    """
-    Optional debug: prints whoami + visible projects.
-    Enable with env JIRA_DIAGNOSTIC=1
-    """
     if os.getenv("JIRA_DIAGNOSTIC", "").strip() != "1":
         return
 
