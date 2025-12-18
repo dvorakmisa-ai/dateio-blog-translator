@@ -124,6 +124,20 @@ def _img_src_from_tag(img: Tag) -> str:
     return ""
 
 
+def _direct_text_only(el: Tag) -> str:
+    """
+    Returns only direct text nodes (not descendant text), normalized.
+    Useful for Webflow divs where text isn't wrapped in <p>.
+    """
+    if not isinstance(el, Tag):
+        return ""
+    parts = []
+    for c in el.contents:
+        if isinstance(c, NavigableString):
+            parts.append(str(c))
+    return _norm_ws("".join(parts))
+
+
 def _html_to_mdish(root: Tag, base_url: str) -> str:
     """
     Block HTML -> md-ish with explicit heading labels:
@@ -156,6 +170,7 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
     def handle(el: Tag, indent: int = 0):
         name = (el.name or "").lower()
 
+        # Headings
         if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
             level = int(name[1])
             text = _norm_ws(el.get_text(" ", strip=True))
@@ -163,6 +178,7 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 blocks.append(f"H{level}: {text}")
             return
 
+        # Figure with img + caption
         if name == "figure":
             img = el.find("img")
             if img:
@@ -171,16 +187,19 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 add_image_placeholder(img, caption=caption)
             return
 
+        # Standalone img
         if name == "img":
             add_image_placeholder(el, caption="")
             return
 
+        # Paragraph
         if name == "p":
             text = _inline_to_mdish(el, base_url).strip()
             if text:
                 blocks.append(text)
             return
 
+        # Lists
         if name == "ul":
             for li in el.find_all("li", recursive=False):
                 txt = _norm_ws(_inline_to_mdish(li, base_url))
@@ -201,14 +220,28 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                     handle(child, indent=indent + 1)
             return
 
+        # NEW: capture direct text inside div/section when not wrapped in <p>
+        if name in ("div", "section", "article", "main"):
+            direct = _direct_text_only(el)
+            if direct:
+                blocks.append(direct)
+            # keep recursing to preserve order
+            for child in el.find_all(recursive=False):
+                if isinstance(child, Tag):
+                    handle(child, indent=indent)
+            return
+
+        # Default: containers recurse
         for child in el.find_all(recursive=False):
             if isinstance(child, Tag):
                 handle(child, indent=indent)
 
+    # Walk direct children to reduce nav/footer noise
     for child in root.find_all(recursive=False):
         if isinstance(child, Tag):
             handle(child, indent=0)
 
+    # Join as paragraphs separated by blank lines
     out: list[str] = []
     for b in blocks:
         if (
@@ -220,76 +253,65 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
         else:
             out.append(_norm_ws(b))
     return "\n\n".join([x for x in out if x.strip()]).strip()
+# ===== END structured parsing =====
 
 
-# ===== NEW: FAQ extraction =====
-def extract_faqs(soup: BeautifulSoup) -> list[str]:
+# ===== NEW: FAQ post-processing from the md-ish body =====
+def _rewrite_faq_section(body: str) -> str:
     """
-    Extract FAQs as ordered Q/A blocks in md-ish form.
-    Tries schema.org FAQPage first; then common class/id patterns.
+    Finds a section headed by 'H2: FAQs' (or similar) and rewrites subsequent
+    blocks into structured FAQ Q/A pairs until the next heading.
     """
-    blocks: list[str] = []
+    text = (body or "").strip()
+    if not text:
+        return text
 
-    # Find likely FAQ containers
-    faq_roots = []
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
 
-    # schema.org FAQPage anywhere
-    faq_roots.extend(soup.select('[itemtype*="FAQPage"]'))
+    def is_heading(b: str) -> bool:
+        return bool(re.match(r"^H[1-6]:\s+", b)) or bool(re.match(r"^(#{1,6})\s+", b))
 
-    # common ids/classes
-    faq_roots.extend(soup.select("#faq, #faqs, .faq, .faqs"))
+    def is_faq_heading(b: str) -> bool:
+        # handles "H2: FAQs", "H2: FAQ", also Markdown "## FAQs"
+        if re.match(r"^H[1-6]:\s*FAQs?\s*$", b, flags=re.IGNORECASE):
+            return True
+        m = re.match(r"^(#{1,6})\s*(FAQs?)\s*$", b, flags=re.IGNORECASE)
+        return bool(m)
 
-    # de-duplicate while preserving order
-    seen = set()
-    uniq_roots = []
-    for r in faq_roots:
-        rid = id(r)
-        if rid not in seen:
-            seen.add(rid)
-            uniq_roots.append(r)
-
-    if not uniq_roots:
-        return blocks
-
-    blocks.append("H2: FAQs")
-    q_idx = 1
-
-    for root in uniq_roots:
-        # Schema.org pattern: mainEntity -> name + acceptedAnswer
-        entities = root.select('[itemprop="mainEntity"]')
-        if entities:
-            for e in entities:
-                q = e.select_one('[itemprop="name"]')
-                a = e.select_one('[itemprop="acceptedAnswer"]')
-                if q and a:
-                    q_text = _norm_ws(q.get_text(" ", strip=True))
-                    a_text = _norm_ws(a.get_text(" ", strip=True))
-                    if q_text:
-                        blocks.append(f"FAQ Q{q_idx}: {q_text}")
-                        if a_text:
-                            blocks.append(f"FAQ A{q_idx}: {a_text}")
-                        q_idx += 1
+    out: list[str] = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if not is_faq_heading(b):
+            out.append(b)
+            i += 1
             continue
 
-        # Fallback: look for headings (h3/h4) followed by paragraph/div as answer
-        for h in root.find_all(["h3", "h4"], recursive=True):
-            q_text = _norm_ws(h.get_text(" ", strip=True))
-            if not q_text:
-                continue
+        # Keep the FAQ heading as H2
+        out.append("H2: FAQs")
+        i += 1
 
-            # find a plausible answer node near it
-            ans = h.find_next_sibling(["p", "div"])
-            a_text = _norm_ws(ans.get_text(" ", strip=True)) if ans else ""
+        # Collect blocks until next heading
+        faq_items: list[str] = []
+        while i < len(blocks) and not is_heading(blocks[i]):
+            faq_items.append(blocks[i])
+            i += 1
 
-            blocks.append(f"FAQ Q{q_idx}: {q_text}")
-            if a_text:
-                blocks.append(f"FAQ A{q_idx}: {a_text}")
-            q_idx += 1
+        # Pair them Q/A (Q then A)
+        qn = 1
+        j = 0
+        while j < len(faq_items):
+            q = faq_items[j].strip()
+            a = faq_items[j + 1].strip() if j + 1 < len(faq_items) else ""
+            if q:
+                out.append(f"FAQ Q{qn}: {q}")
+                if a:
+                    out.append(f"FAQ A{qn}: {a}")
+                qn += 1
+            j += 2
 
-    # If we failed to find any Qs, return empty
-    has_any_q = any(b.startswith("FAQ Q") for b in blocks)
-    return blocks if has_any_q else []
-# ===== END FAQ extraction =====
+    return "\n\n".join(out).strip()
+# ===== END FAQ post-processing =====
 
 
 def extract_article(article_html: str, article_url: str) -> dict:
@@ -335,11 +357,8 @@ def extract_article(article_html: str, article_url: str) -> dict:
         ]
         body = "\n\n".join(paragraphs).strip()
 
-    # ===== NEW: Append FAQs (if found) =====
-    faq_blocks = extract_faqs(soup)
-    if faq_blocks:
-        body = (body + "\n\n" + "\n\n".join(faq_blocks)).strip()
-    # ===== END NEW =====
+    # NEW: rewrite FAQ section (works even when FAQ isn't in special HTML container)
+    body = _rewrite_faq_section(body)
 
     return {
         "url": article_url,
@@ -436,16 +455,6 @@ def adf_ordered_list(items: list[str]) -> dict:
 
 
 def mdish_to_adf_blocks(text: str) -> list[dict]:
-    """
-    Conversion:
-    - split into blocks by blank lines
-    - headings: "H2: ..." OR markdown "# ..."
-    - bullet lists: lines starting "- "
-    - ordered lists: lines "1. ..."
-    - image markers: "IMG1: ..."
-    - FAQ markers: "FAQ Q1:" / "FAQ A1:"
-    - everything else paragraph
-    """
     blocks: list[dict] = []
     text = (text or "").strip()
     if not text:
@@ -456,39 +465,33 @@ def mdish_to_adf_blocks(text: str) -> list[dict]:
         if not b:
             continue
 
-        # Headings "H2: ..."
         m_h = re.match(r"^H([1-6]):\s+(.*)$", b)
         if m_h:
             level = int(m_h.group(1))
             blocks.append(adf_heading(m_h.group(2).strip(), level=level))
             continue
 
-        # Markdown headings "# ..."
         m = re.match(r"^(#{1,6})\s+(.*)$", b)
         if m:
             level = min(6, max(1, len(m.group(1))))
             blocks.append(adf_heading(m.group(2).strip(), level=level))
             continue
 
-        # Image marker
         if re.match(r"^IMG\d+:\s+", b):
             blocks.append(adf_paragraph("🖼️ " + b))
             continue
 
-        # FAQ markers
         if re.match(r"^FAQ\s+[QA]\d+:\s+", b):
             blocks.append(adf_paragraph("❓ " + b))
             continue
 
         lines = [ln.rstrip() for ln in b.split("\n") if ln.strip()]
 
-        # Bullet list
         if lines and all(re.match(r"^\s*-\s+.+$", ln) for ln in lines):
             items = [re.sub(r"^\s*-\s+", "", ln).strip() for ln in lines]
             blocks.append(adf_bullet_list(items))
             continue
 
-        # Ordered list
         if lines and all(re.match(r"^\s*\d+\.\s+.+$", ln) for ln in lines):
             items = [re.sub(r"^\s*\d+\.\s+", "", ln).strip() for ln in lines]
             blocks.append(adf_ordered_list(items))
