@@ -220,12 +220,11 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                     handle(child, indent=indent + 1)
             return
 
-        # NEW: capture direct text inside div/section when not wrapped in <p>
+        # capture direct text inside div/section when not wrapped in <p>
         if name in ("div", "section", "article", "main"):
             direct = _direct_text_only(el)
             if direct:
                 blocks.append(direct)
-            # keep recursing to preserve order
             for child in el.find_all(recursive=False):
                 if isinstance(child, Tag):
                     handle(child, indent=indent)
@@ -256,12 +255,8 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
 # ===== END structured parsing =====
 
 
-# ===== NEW: FAQ post-processing from the md-ish body =====
+# ===== FAQ post-processing from the md-ish body =====
 def _rewrite_faq_section(body: str) -> str:
-    """
-    Finds a section headed by 'H2: FAQs' (or similar) and rewrites subsequent
-    blocks into structured FAQ Q/A pairs until the next heading.
-    """
     text = (body or "").strip()
     if not text:
         return text
@@ -272,7 +267,6 @@ def _rewrite_faq_section(body: str) -> str:
         return bool(re.match(r"^H[1-6]:\s+", b)) or bool(re.match(r"^(#{1,6})\s+", b))
 
     def is_faq_heading(b: str) -> bool:
-        # handles "H2: FAQs", "H2: FAQ", also Markdown "## FAQs"
         if re.match(r"^H[1-6]:\s*FAQs?\s*$", b, flags=re.IGNORECASE):
             return True
         m = re.match(r"^(#{1,6})\s*(FAQs?)\s*$", b, flags=re.IGNORECASE)
@@ -287,17 +281,14 @@ def _rewrite_faq_section(body: str) -> str:
             i += 1
             continue
 
-        # Keep the FAQ heading as H2
         out.append("H2: FAQs")
         i += 1
 
-        # Collect blocks until next heading
         faq_items: list[str] = []
         while i < len(blocks) and not is_heading(blocks[i]):
             faq_items.append(blocks[i])
             i += 1
 
-        # Pair them Q/A (Q then A)
         qn = 1
         j = 0
         while j < len(faq_items):
@@ -357,7 +348,6 @@ def extract_article(article_html: str, article_url: str) -> dict:
         ]
         body = "\n\n".join(paragraphs).strip()
 
-    # NEW: rewrite FAQ section (works even when FAQ isn't in special HTML container)
     body = _rewrite_faq_section(body)
 
     return {
@@ -509,6 +499,10 @@ def build_description_adf(article: dict, hu: dict) -> dict:
     content.append(adf_heading("HU překlad blogu", level=2))
 
     content.append(adf_heading("Originál", level=3))
+
+    # NEW: stable dedupe marker
+    content.append(adf_paragraph(f"SOURCE_URL: {article['url']}"))
+
     content.append(adf_paragraph(f"URL: {article['url']}"))
     content.append(adf_paragraph(f"Title: {article.get('title') or ''}"))
     content.append(adf_paragraph(f"Meta title: {article.get('meta_title') or ''}"))
@@ -580,11 +574,25 @@ def jira_diagnostic() -> None:
     print("=== END DIAGNOSTIC ===\n")
 
 
+# NEW: robust JQL escaping
+def jql_escape(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+# CHANGED: dedupe by SOURCE_URL marker in description (stable)
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
-    jql = f'project = {project_key} AND labels = "dateio-auto-translate" AND text ~ "{article_url}"'
+    project_key = (project_key or "").strip().strip('"').strip("'")
+    needle = f"SOURCE_URL: {article_url}"
+
+    jql = (
+        f'project = "{project_key}" '
+        f'AND labels = dateio-auto-translate '
+        f'AND description ~ "{jql_escape(needle)}"'
+    )
+
     r = jira_request(
         "GET",
-        "/rest/api/3/search/jql",
+        "/rest/api/3/search",
         params={"jql": jql, "maxResults": 1, "fields": "key"},
     )
     r.raise_for_status()
@@ -710,6 +718,7 @@ def main():
     project_key = require_env("JIRA_PROJECT_KEY").strip().strip('"').strip("'")
 
     for url in new_urls:
+        # robust Jira dedupe
         if jira_issue_exists_for_url(project_key, url):
             print(f"V Jira už existuje issue pro: {url}")
             processed.add(url)
