@@ -500,7 +500,7 @@ def build_description_adf(article: dict, hu: dict) -> dict:
 
     content.append(adf_heading("Originál", level=3))
 
-    # NEW: stable dedupe marker
+    # stable dedupe marker (for Jira search)
     content.append(adf_paragraph(f"SOURCE_URL: {article['url']}"))
 
     content.append(adf_paragraph(f"URL: {article['url']}"))
@@ -574,12 +574,11 @@ def jira_diagnostic() -> None:
     print("=== END DIAGNOSTIC ===\n")
 
 
-# NEW: robust JQL escaping
 def jql_escape(s: str) -> str:
     return (s or "").replace("\\", "\\\\").replace('"', '\\"')
 
 
-# CHANGED: dedupe by SOURCE_URL marker in description (stable)
+# CHANGED: dedupe via text search for SOURCE_URL marker (works better than description~ on some Jiras)
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     project_key = (project_key or "").strip().strip('"').strip("'")
     needle = f"SOURCE_URL: {article_url}"
@@ -587,7 +586,7 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     jql = (
         f'project = "{project_key}" '
         f'AND labels = "dateio-auto-translate" '
-        f'AND description ~ "{jql_escape(needle)}"'
+        f'AND text ~ "{jql_escape(needle)}"'
     )
 
     r = jira_request(
@@ -718,7 +717,6 @@ def main():
     project_key = require_env("JIRA_PROJECT_KEY").strip().strip('"').strip("'")
 
     for url in new_urls:
-        # robust Jira dedupe
         if jira_issue_exists_for_url(project_key, url):
             print(f"V Jira už existuje issue pro: {url}")
             processed.add(url)
