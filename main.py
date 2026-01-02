@@ -585,18 +585,22 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
     jql = (
         f'project = "{project_key}" '
-        f'AND labels = "dateio-auto-translate" '
         f'AND text ~ "{jql_escape(needle)}"'
     )
 
     r = jira_request(
         "GET",
         "/rest/api/3/search/jql",
-        params={"jql": jql, "maxResults": 1, "fields": "key"},
+        params={"jql": jql, "maxResults": 2, "fields": "key"},
     )
     r.raise_for_status()
-    return r.json().get("total", 0) > 0
 
+    total = r.json().get("total", 0)
+    if total > 0:
+        keys = [i["key"] for i in r.json().get("issues", [])]
+        print(f"🔒 Dedup hit for URL {article_url}: {keys}")
+
+    return total > 0
 
 def jira_get_issue_type_name(project_key: str) -> str:
     desired = (os.getenv("JIRA_ISSUE_TYPE") or "").strip()
