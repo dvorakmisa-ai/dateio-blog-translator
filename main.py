@@ -595,28 +595,41 @@ def jira_diagnostic() -> None:
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     """
     Robust dedupe:
-    - compute SOURCE_ID from URL
-    - search by "SOURCE_ID: SRC_xxx" (simple token, Jira index-friendly)
+    - use SOURCE_ID token (SRC_xxx) without punctuation
+    - first search in the configured project
+    - if not found, fallback to global search (in case project key/env mismatch)
     """
     project_key = (project_key or "").strip().strip('"').strip("'")
-    source_id = make_source_id(article_url)
-    needle = f"SOURCE_ID: {source_id}"
+    source_id = make_source_id(article_url)   # e.g. SRC_ab12cd34ef56
 
-    jql = f'project = "{project_key}" AND text ~ "{jql_escape(needle)}"'
+    def run_jql(jql: str) -> tuple[int, list[str]]:
+        r = jira_request(
+            "GET",
+            "/rest/api/3/search/jql",
+            params={"jql": jql, "maxResults": 5, "fields": "key"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        keys = [it.get("key") for it in data.get("issues", []) if it.get("key")]
+        return int(data.get("total", 0)), keys
 
-    r = jira_request(
-        "GET",
-        "/rest/api/3/search/jql",
-        params={"jql": jql, "maxResults": 2, "fields": "key"},
+    # 1) Search inside project
+    jql_project = (
+        f'project = "{project_key}" '
+        f'AND text ~ "{jql_escape(source_id)}"'
     )
-    r.raise_for_status()
 
-    total = r.json().get("total", 0)
+    total, keys = run_jql(jql_project)
+    print(f"DEDUPE(project) JQL: {jql_project} -> total={total} keys={keys}")
     if total > 0:
-        keys = [i.get("key") for i in r.json().get("issues", [])]
-        print(f"🔒 Dedup hit ({source_id}) -> {keys}")
+        return True
 
-    return total > 0
+    # 2) Fallback: global search (protects against wrong project key / moved issues)
+    jql_global = f'text ~ "{jql_escape(source_id)}"'
+    total2, keys2 = run_jql(jql_global)
+    print(f"DEDUPE(global) JQL: {jql_global} -> total={total2} keys={keys2}")
+    return total2 > 0
+
 
 
 def jira_get_issue_type_name(project_key: str) -> str:
