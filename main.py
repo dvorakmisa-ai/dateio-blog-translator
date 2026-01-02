@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import hashlib
 from urllib.parse import urljoin
 
 import requests
@@ -36,6 +37,20 @@ def load_state() -> set[str]:
 def save_state(processed_urls: set[str]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({"processed_urls": sorted(processed_urls)}, f, ensure_ascii=False, indent=2)
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def jql_escape(s: str) -> str:
+    # basic Jira JQL string escaping
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def make_source_id(url: str) -> str:
+    # stable, search-friendly token (no ://, no slashes)
+    h = hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
+    return f"SRC_{h}"
 
 
 # -----------------------
@@ -386,6 +401,7 @@ Pravidla:
   - zachovej **tučné** a *kurzívu* (markdown značky)
   - zachovej odkazy ve formátu [text](URL); URL se NESMÍ měnit
   - zachovej řádky začínající "IMG" (např. "IMG1: ...") – neupravuj je a nepřekládej URL/atributy
+  - zachovej řádky "SOURCE_ID:" a "SOURCE_URL:" (neměň je)
 - pokud meta_title nebo meta_description chybí, navrhni je z obsahu
 - žádné jiné klíče, žádné komentáře
 
@@ -500,7 +516,9 @@ def build_description_adf(article: dict, hu: dict) -> dict:
 
     content.append(adf_heading("Originál", level=3))
 
-    # stable dedupe marker (for Jira search)
+    # stable dedupe marker (search-friendly)
+    source_id = make_source_id(article["url"])
+    content.append(adf_paragraph(f"SOURCE_ID: {source_id}"))
     content.append(adf_paragraph(f"SOURCE_URL: {article['url']}"))
 
     content.append(adf_paragraph(f"URL: {article['url']}"))
@@ -574,19 +592,17 @@ def jira_diagnostic() -> None:
     print("=== END DIAGNOSTIC ===\n")
 
 
-def jql_escape(s: str) -> str:
-    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
-
-
-# CHANGED: dedupe via text search for SOURCE_URL marker (works better than description~ on some Jiras)
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
+    """
+    Robust dedupe:
+    - compute SOURCE_ID from URL
+    - search by "SOURCE_ID: SRC_xxx" (simple token, Jira index-friendly)
+    """
     project_key = (project_key or "").strip().strip('"').strip("'")
-    needle = f"SOURCE_URL: {article_url}"
+    source_id = make_source_id(article_url)
+    needle = f"SOURCE_ID: {source_id}"
 
-    jql = (
-        f'project = "{project_key}" '
-        f'AND text ~ "{jql_escape(needle)}"'
-    )
+    jql = f'project = "{project_key}" AND text ~ "{jql_escape(needle)}"'
 
     r = jira_request(
         "GET",
@@ -597,10 +613,11 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
     total = r.json().get("total", 0)
     if total > 0:
-        keys = [i["key"] for i in r.json().get("issues", [])]
-        print(f"🔒 Dedup hit for URL {article_url}: {keys}")
+        keys = [i.get("key") for i in r.json().get("issues", [])]
+        print(f"🔒 Dedup hit ({source_id}) -> {keys}")
 
     return total > 0
+
 
 def jira_get_issue_type_name(project_key: str) -> str:
     desired = (os.getenv("JIRA_ISSUE_TYPE") or "").strip()
