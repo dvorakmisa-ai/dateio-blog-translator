@@ -586,13 +586,13 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
 
     jql = (
         f'project = "{project_key}" '
-        f'AND labels = dateio-auto-translate '
+        f'AND labels = "dateio-auto-translate" '
         f'AND description ~ "{jql_escape(needle)}"'
     )
 
     r = jira_request(
         "GET",
-        "/rest/api/3/search",
+        "/rest/api/3/search/jql",
         params={"jql": jql, "maxResults": 1, "fields": "key"},
     )
     r.raise_for_status()
