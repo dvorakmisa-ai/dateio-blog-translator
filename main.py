@@ -40,15 +40,14 @@ def save_state(processed_urls: set[str]) -> None:
 
 
 # -----------------------
-# Helpers
+# Helpers (dedupe)
 # -----------------------
 def jql_escape(s: str) -> str:
-    # basic Jira JQL string escaping
     return (s or "").replace("\\", "\\\\").replace('"', '\\"')
 
 
 def make_source_id(url: str) -> str:
-    # stable, search-friendly token (no ://, no slashes)
+    # stable, search-friendly token (no punctuation)
     h = hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
     return f"SRC_{h}"
 
@@ -185,7 +184,6 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
     def handle(el: Tag, indent: int = 0):
         name = (el.name or "").lower()
 
-        # Headings
         if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
             level = int(name[1])
             text = _norm_ws(el.get_text(" ", strip=True))
@@ -193,7 +191,6 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 blocks.append(f"H{level}: {text}")
             return
 
-        # Figure with img + caption
         if name == "figure":
             img = el.find("img")
             if img:
@@ -202,19 +199,16 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                 add_image_placeholder(img, caption=caption)
             return
 
-        # Standalone img
         if name == "img":
             add_image_placeholder(el, caption="")
             return
 
-        # Paragraph
         if name == "p":
             text = _inline_to_mdish(el, base_url).strip()
             if text:
                 blocks.append(text)
             return
 
-        # Lists
         if name == "ul":
             for li in el.find_all("li", recursive=False):
                 txt = _norm_ws(_inline_to_mdish(li, base_url))
@@ -235,7 +229,6 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                     handle(child, indent=indent + 1)
             return
 
-        # capture direct text inside div/section when not wrapped in <p>
         if name in ("div", "section", "article", "main"):
             direct = _direct_text_only(el)
             if direct:
@@ -245,17 +238,14 @@ def _html_to_mdish(root: Tag, base_url: str) -> str:
                     handle(child, indent=indent)
             return
 
-        # Default: containers recurse
         for child in el.find_all(recursive=False):
             if isinstance(child, Tag):
                 handle(child, indent=indent)
 
-    # Walk direct children to reduce nav/footer noise
     for child in root.find_all(recursive=False):
         if isinstance(child, Tag):
             handle(child, indent=0)
 
-    # Join as paragraphs separated by blank lines
     out: list[str] = []
     for b in blocks:
         if (
@@ -323,7 +313,6 @@ def _rewrite_faq_section(body: str) -> str:
 def extract_article(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "html.parser")
 
-    # Visible title (H1 preferred)
     title = "Untitled"
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
@@ -331,7 +320,6 @@ def extract_article(article_html: str, article_url: str) -> dict:
     elif soup.title and soup.title.get_text(strip=True):
         title = soup.title.get_text(strip=True)
 
-    # Meta title (OG preferred, fallback <title>)
     meta_title = None
     og_title = soup.find("meta", attrs={"property": "og:title"})
     if og_title and og_title.get("content"):
@@ -339,7 +327,6 @@ def extract_article(article_html: str, article_url: str) -> dict:
     elif soup.title and soup.title.get_text(strip=True):
         meta_title = soup.title.get_text(strip=True)
 
-    # Meta description (name=description preferred, fallback og:description)
     meta_description = None
     meta_desc = soup.find("meta", attrs={"name": "description"})
     if meta_desc and meta_desc.get("content"):
@@ -349,7 +336,6 @@ def extract_article(article_html: str, article_url: str) -> dict:
         if og_desc and og_desc.get("content"):
             meta_description = og_desc["content"].strip()
 
-    # Body: structured parse with fallback
     content_root = soup.find("article") or soup.select_one("main") or soup.body
     body = ""
     if content_root:
@@ -375,7 +361,7 @@ def extract_article(article_html: str, article_url: str) -> dict:
 
 
 # -----------------------
-# OpenAI translation (incl. metadata)
+# OpenAI translation
 # -----------------------
 def translate_to_hungarian(client: OpenAI, article: dict) -> dict:
     prompt = f"""
@@ -386,7 +372,7 @@ Vrať výstup POUZE jako JSON:
   "title": "...",
   "meta_title": "...",
   "meta_description": "...",
-  "body": "..."   // text s odstavci (může být Markdown)
+  "body": "..."
 }}
 
 Pravidla:
@@ -516,7 +502,6 @@ def build_description_adf(article: dict, hu: dict) -> dict:
 
     content.append(adf_heading("Originál", level=3))
 
-    # stable dedupe marker (search-friendly)
     source_id = make_source_id(article["url"])
     content.append(adf_paragraph(f"SOURCE_ID: {source_id}"))
     content.append(adf_paragraph(f"SOURCE_URL: {article['url']}"))
@@ -595,12 +580,12 @@ def jira_diagnostic() -> None:
 def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     """
     Robust dedupe:
-    - use SOURCE_ID token (SRC_xxx) without punctuation
-    - first search in the configured project
-    - if not found, fallback to global search (in case project key/env mismatch)
+    - search by the simple token SRC_xxx (index-friendly)
+    - try within project; if not found, fallback to global search
+    - prints JQL + results to Actions log
     """
     project_key = (project_key or "").strip().strip('"').strip("'")
-    source_id = make_source_id(article_url)   # e.g. SRC_ab12cd34ef56
+    source_id = make_source_id(article_url)
 
     def run_jql(jql: str) -> tuple[int, list[str]]:
         r = jira_request(
@@ -613,23 +598,16 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
         keys = [it.get("key") for it in data.get("issues", []) if it.get("key")]
         return int(data.get("total", 0)), keys
 
-    # 1) Search inside project
-    jql_project = (
-        f'project = "{project_key}" '
-        f'AND text ~ "{jql_escape(source_id)}"'
-    )
-
+    jql_project = f'project = "{project_key}" AND text ~ "{jql_escape(source_id)}"'
     total, keys = run_jql(jql_project)
     print(f"DEDUPE(project) JQL: {jql_project} -> total={total} keys={keys}")
     if total > 0:
         return True
 
-    # 2) Fallback: global search (protects against wrong project key / moved issues)
     jql_global = f'text ~ "{jql_escape(source_id)}"'
     total2, keys2 = run_jql(jql_global)
     print(f"DEDUPE(global) JQL: {jql_global} -> total={total2} keys={keys2}")
     return total2 > 0
-
 
 
 def jira_get_issue_type_name(project_key: str) -> str:
@@ -749,8 +727,12 @@ def main():
 
     openai_client = OpenAI(api_key=require_env("OPENAI_API_KEY"))
     project_key = require_env("JIRA_PROJECT_KEY").strip().strip('"').strip("'")
+    print("DEBUG project_key =", project_key)
 
     for url in new_urls:
+        print("DEBUG url =", url)
+        print("DEBUG source_id =", make_source_id(url))
+
         if jira_issue_exists_for_url(project_key, url):
             print(f"V Jira už existuje issue pro: {url}")
             processed.add(url)
