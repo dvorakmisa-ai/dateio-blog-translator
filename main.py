@@ -47,9 +47,9 @@ def jql_escape(s: str) -> str:
 
 
 def make_source_id(url: str) -> str:
-    # stable, search-friendly token (no punctuation)
+    # Jira index někdy špatně tokenizuje "_" apod., proto jen alfanumericky
     h = hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
-    return f"SRC_{h}"
+    return f"SRC{h}"
 
 
 # -----------------------
@@ -585,7 +585,9 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
     - prints JQL + results to Actions log
     """
     project_key = (project_key or "").strip().strip('"').strip("'")
-    source_id = make_source_id(article_url)
+    source_id = make_source_id(article_url) 
+    source_id_new = make_source_id(article_url)  # SRCxxxxxxxxxxxx
+    source_id_old = "SRC_" + source_id_new.replace("SRC", "", 1)  # SRC_xxxxxxxxxxxx
 
     def run_jql(jql: str) -> tuple[int, list[str]]:
         r = jira_request(
@@ -598,16 +600,14 @@ def jira_issue_exists_for_url(project_key: str, article_url: str) -> bool:
         keys = [it.get("key") for it in data.get("issues", []) if it.get("key")]
         return int(data.get("total", 0)), keys
 
-    jql_project = f'project = "{project_key}" AND text ~ "{jql_escape(source_id)}"'
-    total, keys = run_jql(jql_project)
-    print(f"DEDUPE(project) JQL: {jql_project} -> total={total} keys={keys}")
-    if total > 0:
-        return True
-
-    jql_global = f'text ~ "{jql_escape(source_id)}"'
-    total2, keys2 = run_jql(jql_global)
-    print(f"DEDUPE(global) JQL: {jql_global} -> total={total2} keys={keys2}")
-    return total2 > 0
+    jql_project = (
+    f'project = "{project_key}" '
+    f'AND labels = "dateio-auto-translate" '
+    f'AND ('
+    f'summary ~ "{jql_escape(source_id_new)}" OR text ~ "{jql_escape(source_id_new)}" OR '
+    f'summary ~ "{jql_escape(source_id_old)}" OR text ~ "{jql_escape(source_id_old)}"'
+    f')'
+)
 
 
 def jira_get_issue_type_name(project_key: str) -> str:
@@ -749,7 +749,8 @@ def main():
         hu = translate_to_hungarian(openai_client, article)
         description_adf = build_description_adf(article, hu)
 
-        summary = f"[HU] {article['title']}"
+        source_id = make_source_id(url)
+        summary = f"[HU] {article['title']} [{source_id}]"
         issue_key = jira_create_issue(summary, description_adf)
 
         print(f"Vytvořeno: {issue_key} ← {url}")
