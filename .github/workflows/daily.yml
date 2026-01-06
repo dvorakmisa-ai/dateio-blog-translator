@@ -17,6 +17,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ✅ Restore persisted state.json from Actions cache (prevents reprocessing everything)
+      - name: Restore state.json cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: blog-jira-state
+          restore-keys: |
+            blog-jira-state
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -35,6 +44,14 @@ jobs:
         run: |
           python main.py
 
+      # ✅ Save state.json back into cache for the next run
+      - name: Save state.json cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: blog-jira-state
+
+      # (Optional) keep artifact upload for easy debugging/inspection
       - name: Upload state.json as artifact
         if: always()
         uses: actions/upload-artifact@v4
